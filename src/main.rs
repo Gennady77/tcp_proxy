@@ -1,5 +1,6 @@
 mod handel_tcp;
 mod handle_udp;
+mod net_packet_parser;
 
 use handel_tcp::handle_tcp;
 use handle_udp::handle_upd;
@@ -14,7 +15,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     tokio::select! {
-        _ = handle_tcp() => {}
+        // _ = handle_tcp() => {}
         _ = handle_upd() => {}
     }
 
