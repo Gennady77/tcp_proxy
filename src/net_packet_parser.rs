@@ -125,118 +125,6 @@ pub trait IpTcpPacket {
     fn destination_port(&self) -> u16;
     fn acknowledgment_number(&self) -> u32;
     fn window_size(&self) -> u16;
-    fn get_raw_handshake_response(&self, seq_num: u32, wnd_scl: u8) -> Result<(RawIpPacket, u32), std::io::Error> {
-        let curr_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32;
-
-        let options = vec![
-            TcpOptionElement::MaximumSegmentSize(self.options().mss),
-            TcpOptionElement::WindowScale(wnd_scl),
-            TcpOptionElement::Timestamp(curr_timestamp, self.options().timestamp.0)
-        ];
-
-        let ack = self.sequence_number().wrapping_add(1);
-
-        let builder = self.build_ip_packet()
-            .tcp(
-                self.destination_port(),
-                self.source_port(),
-                seq_num,
-                65535
-            )
-            .syn()
-            .ack(ack);
-
-        let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
-
-        let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(0));
-        let payload = Vec::<u8>::new();
-
-        builder_with_options.write(&mut buffer, &payload).unwrap();
-
-        Ok((buffer, ack))
-    }
-    fn get_ack_response(&self, seq_num: u32, ack_num: u32, win_size: u32, wnd_scl: u8) -> Result<(RawIpPacket, u32), std::io::Error> {
-        let curr_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32;
-
-        let options = vec![
-            TcpOptionElement::MaximumSegmentSize(self.options().mss),
-            TcpOptionElement::WindowScale(0),
-            TcpOptionElement::Timestamp(curr_timestamp, self.options().timestamp.0)
-        ];
-
-        let builder = self.build_ip_packet()
-            .tcp(
-                self.destination_port(),
-                self.source_port(),
-                self.acknowledgment_number(),
-                (win_size >> wnd_scl) as u16,
-            )
-            .ack(ack_num);
-
-        let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
-
-        let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(0));
-        let payload = Vec::<u8>::new();
-
-        builder_with_options.write(&mut buffer, &payload).unwrap();
-
-        Ok((buffer, ack_num))
-    }
-    fn get_ack_data_response(&self,
-        payload: Vec<u8>,
-        win_size: u16,
-        seq_num: u32,
-        ack_num: u32,
-        mss: u16,
-        wnd_scl: u8,
-        psh: bool,
-    ) -> Result<RawIpPacket, std::io::Error> {
-        let curr_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32;
-
-        let options = vec![
-            TcpOptionElement::MaximumSegmentSize(mss),
-            TcpOptionElement::WindowScale(wnd_scl),
-            TcpOptionElement::Timestamp(curr_timestamp, self.options().timestamp.0)
-        ];
-
-        let mut builder = self.build_ip_packet()
-            .tcp(
-                self.destination_port(),
-                self.source_port(),
-                seq_num,
-                win_size,
-            )
-            .ack(ack_num);
-
-        if psh {
-            builder = builder.psh();
-        }
-
-        let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
-
-        let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(payload.len()));
-
-        builder_with_options.write(&mut buffer, &payload).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
-
-        Ok(buffer)
-    }
     fn syn(&self) -> bool;
     fn ack(&self) -> bool;
     fn psh(&self) -> bool;
@@ -391,6 +279,153 @@ impl Display for Ipv6TcpPacket {
             self.tcp
         )
     }
+}
+
+pub fn get_handshake_response(
+    ack_num: u32,
+    destination_addr: Ipv4Addr,
+    destination_port: u16,
+    mss: u16,
+    seq_num: u32,
+    source_addr: Ipv4Addr,
+    source_port: u16,
+    timestamp: u32,
+    wnd_scl: u8,
+    win_size: u16,
+) -> Result<RawIpPacket, std::io::Error> {
+    let curr_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32;
+
+    let options = vec![
+        TcpOptionElement::MaximumSegmentSize(mss),
+        TcpOptionElement::WindowScale(wnd_scl),
+        TcpOptionElement::Timestamp(curr_timestamp, timestamp)
+    ];
+
+    let builder = PacketBuilder::
+        ipv4(
+            source_addr.octets(),
+            destination_addr.octets(),
+            64
+        )
+        .tcp(
+            source_port,
+            destination_port,
+            seq_num,
+            win_size
+        )
+        .syn()
+        .ack(ack_num);
+
+    let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+
+    let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(0));
+    let payload = Vec::<u8>::new();
+
+    builder_with_options.write(&mut buffer, &payload).unwrap();
+
+    Ok(buffer)
+}
+
+pub fn get_ack_response(
+    ack_num: u32,
+    destination_addr: Ipv4Addr,
+    destination_port: u16,
+    seq_num: u32,
+    source_addr: Ipv4Addr,
+    source_port: u16,
+    timestamp: u32,
+    win_size: u16,
+) -> Result<RawIpPacket, std::io::Error> {
+    let curr_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32;
+
+    let options = vec![
+        TcpOptionElement::Timestamp(curr_timestamp, timestamp)
+    ];
+
+    let builder = PacketBuilder::
+        ipv4(
+            source_addr.octets(),
+            destination_addr.octets(),
+            64
+        )
+        .tcp(
+            destination_port,
+            source_port,
+            seq_num,
+            win_size,
+        )
+        .ack(ack_num);
+
+    let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+
+    let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(0));
+    let payload = Vec::<u8>::new();
+
+    builder_with_options.write(&mut buffer, &payload).unwrap();
+
+    Ok(buffer)
+}
+
+pub fn get_ack_data_response(
+    ack_num: u32,
+    destination_addr: Ipv4Addr,
+    destination_port: u16,
+    payload: Vec<u8>,
+    psh: bool,
+    seq_num: u32,
+    source_addr: Ipv4Addr,
+    source_port: u16,
+    timestamp: u32,
+    win_size: u16,
+) -> Result<RawIpPacket, std::io::Error> {
+    let curr_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32;
+
+    let options = vec![
+        TcpOptionElement::Timestamp(curr_timestamp, timestamp)
+    ];
+
+    let mut builder = PacketBuilder::
+        ipv4(
+            source_addr.octets(),
+            destination_addr.octets(),
+            64
+        )
+        .tcp(
+            source_port,
+            destination_port,
+            seq_num,
+            win_size,
+        )
+        .ack(ack_num);
+
+    if psh {
+        builder = builder.psh();
+    }
+
+    let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+
+    let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(payload.len()));
+
+    builder_with_options.write(&mut buffer, &payload).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+
+    Ok(buffer)
 }
 
 pub fn net_packet_parser(raw_ip_packet: &[u8]) -> Option<Packet> {
