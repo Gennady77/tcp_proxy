@@ -52,8 +52,8 @@ struct TcpConnect {
     stream: TcpStream,
 }
 
-struct ReadHalf<'a>(&'a TcpStateMachine);
-struct WriteHalf<'a>(&'a TcpStateMachine);
+struct ReadHalf<'a>(&'a mut Vec<u8>);
+struct WriteHalf<'a>(&'a mut Vec<u8>);
 
 impl<'a> AsyncRead for ReadHalf<'a>{
     fn poll_read(
@@ -62,20 +62,20 @@ impl<'a> AsyncRead for ReadHalf<'a>{
             buf: &mut tokio::io::ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let state_machine = &mut this.0;
+        let read_buffer = &mut this.0;
 
-        if state_machine.read_buffer.is_empty() {
+        if read_buffer.is_empty() {
             return Poll::Pending;
         }
 
-        let available = state_machine.read_buffer.len();
+        let available = read_buffer.len();
         let to_read = min(available, buf.remaining());
 
         let dst = buf.initialize_unfilled_to(to_read);
-        dst.copy_from_slice(&state_machine.read_buffer[..to_read]);
+        dst.copy_from_slice(&read_buffer[..to_read]);
         buf.advance(to_read);
 
-        state_machine.read_buffer.drain(..to_read);
+        read_buffer.drain(..to_read);
 
         Poll::Ready(Ok(()))
     }
@@ -88,27 +88,20 @@ impl<'a> AsyncWrite for WriteHalf<'a>{
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let state_machine = &mut this.0;
-
-        if state_machine.is_closed() {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "connection closed"
-            )));
-        }
+        let write_buffer = & mut this.0;
 
         let bytes_to_write = buf.len();
 
-        state_machine.write_buffer.extend_from_slice(buf);
+        write_buffer.extend_from_slice(buf);
 
         Poll::Ready(Ok(bytes_to_write))
     }
 
     fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let state_machine = &mut this.0;
+        let write_buffer = &mut this.0;
 
-        if state_machine.write_buffer.is_empty() {
+        if write_buffer.is_empty() {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -204,7 +197,7 @@ impl TcpStateMachine {
     }
 
     fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
-        (ReadHalf(&*self), WriteHalf(&*self))
+        (ReadHalf(&mut self.read_buffer), WriteHalf(&mut self.write_buffer))
     }
 
     async fn send_syn_ack_packet(&self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
@@ -330,7 +323,7 @@ impl TcpStateMachine {
 
                 self.send_syn_ack_packet(packet).await?;
 
-                self.snd_seq.wrapping_add(1);
+                self.snd_seq = self.snd_seq.wrapping_add(1);
 
                 self.state = TcpState::SynReceived;
             }
@@ -346,7 +339,7 @@ impl TcpStateMachine {
                 self.rcv_ack = packet.acknowledgment_number();
                 self.rcv_timestamp = packet.options().timestamp.0;
                 self.snd_ack = self.rcv_seq.wrapping_add(packet.payload().len() as u32);
-                self.wnd_size.wrapping_div(packet.payload().len() as u32);
+                self.wnd_size = self.wnd_size.wrapping_div(packet.payload().len() as u32);
                 self.rcv_wnd = (packet.window_size() << self.wnd_scl) as u32;
 
                 self.handle_data_in_established(packet).await?;
@@ -535,7 +528,7 @@ fn start_sender(state_machine: Arc<Mutex<TcpStateMachine>>) {
 
                 let is_last = sm_guard.write_buffer.is_empty();
 
-                sm_guard.wnd_size.saturating_sub(send_size as u32);
+                sm_guard.wnd_size = sm_guard.wnd_size.saturating_sub(send_size as u32);
                 let win_size = (sm_guard.wnd_size >> sm_guard.wnd_scl) as u16;
 
                 let raw_packet = get_ack_data_response(
@@ -556,10 +549,8 @@ fn start_sender(state_machine: Arc<Mutex<TcpStateMachine>>) {
                     continue;
                 }
 
-                sm_guard.snd_seq.wrapping_add(send_size as u32);
+                sm_guard.snd_seq = sm_guard.snd_seq.wrapping_add(send_size as u32);
             }
-
-            debug!("======= разблокировка state_machine");
 
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
@@ -611,10 +602,11 @@ pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
 
         tokio::spawn(async move {
             debug!("############### handle_upd thread try lock state_machine");
-            let state_machine_guard = state_maschine_clone.lock().await;
-            debug!("############### handle_upd thread got lock state_machine");
+            let mut state_machine_guard = state_maschine_clone.lock().await;
 
             let addr = state_machine_guard.destination_socket_addr;
+
+            debug!("############### handle_upd thread got lock state_machine {}", addr);
 
             match TcpStream::connect(addr).await {
                 Ok(mut destination_connect) => {
@@ -630,6 +622,8 @@ pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
                     error!("Connection error to target: {}", e);
                 }
             }
+
+            debug!("############### handle_upd thread drop lock state_machine {}", addr);
         });
     }
 }
