@@ -1,7 +1,7 @@
 use dashmap::{DashMap, mapref::one::RefMut};
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy}, net::{TcpStream, UdpSocket}, sync::{Mutex, mpsc::{Receiver, UnboundedReceiver, unbounded_channel}}, time::timeout};
 use tracing::{debug, error, warn};
-use std::{cmp::min, collections::{BTreeMap, HashMap, VecDeque}, error::Error, fmt::Display, net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4}, sync::mpsc::Sender, task::{Poll, Waker}, time::Duration};
+use std::{cmp::min, collections::{BTreeMap, HashMap, VecDeque}, error::Error, fmt::Display, net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4}, sync::{atomic::{AtomicU32, Ordering}, mpsc::Sender}, task::{Poll, Waker}, time::Duration};
 use rand::Rng;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -132,7 +132,7 @@ struct TcpStateMachine {
     rcv_wnd: u32,
     read_buffer: Vec<u8>,
     snd_ack: u32,
-    snd_seq: u32,
+    snd_seq: AtomicU32,
     snd_wnd: u16,
     snd_wnd_scl: u8,
     socket: Arc<UdpSocket>,
@@ -141,8 +141,8 @@ struct TcpStateMachine {
     source_port: u16,
     state: TcpState,
     wnd_scl: u8,
-    wnd_size: u32,
-    write_buffer: Vec<u8>,
+    wnd_size: AtomicU32,
+    write_buffer: Mutex<Vec<u8>>,
 }
 
 impl TcpStateMachine {
@@ -183,7 +183,7 @@ impl TcpStateMachine {
             state: TcpState::Close,
             wnd_scl: 0,
             wnd_size: 0,
-            write_buffer: Vec::new(),
+            write_buffer: Mutex::new(Vec::new()),
         };
 
         sm
@@ -380,7 +380,7 @@ fn packet_to_event(packet: TcpPacket) -> TcpEvent {
 
 struct IpOverUdpServer {
     socket: Arc<UdpSocket>,
-    tcp_states: HashMap<String, Arc<Mutex<TcpStateMachine>>>,
+    tcp_states: HashMap<String, Arc<TcpStateMachine>>,
 }
 
 impl IpOverUdpServer {
@@ -457,7 +457,7 @@ impl IpOverUdpServer {
         &mut self,
         packet: Ipv4TcpPacket,
         socket_addr: SocketAddr,
-    ) -> Result<Option<Arc<Mutex<TcpStateMachine>>>, std::io::Error> {
+    ) -> Result<Option<Arc<TcpStateMachine>>, std::io::Error> {
         let destination_socket_addr = packet.destination_socket_addr();
         let seq_num = packet.sequence_number();
 
@@ -478,7 +478,7 @@ impl IpOverUdpServer {
 
             state_machine.process_event(packet).await?;
 
-            let sm = Arc::new(Mutex::new(state_machine));
+            let sm = Arc::new(state_machine);
 
             start_sender(sm.clone());
 
@@ -494,63 +494,62 @@ impl IpOverUdpServer {
             }
         };
 
-        debug!("===handle_ip_tcp_packet try get lock state machine==== {} {}", destination_socket_addr.clone(), seq_num);
-
-        // let mut state_machine_guard = state_machine.lock().await;
-
-        debug!("===handle_ip_tcp_packet got lock state machine==== {} {}", destination_socket_addr.clone(), seq_num);
-
-        let mut state_machine_guard = state_machine.lock().await;
-
-        state_machine_guard.process_event(packet).await?;
+        state_machine.process_event(packet).await?;
 
         Ok(None)
     }
 }
 
-fn start_sender(state_machine: Arc<Mutex<TcpStateMachine>>) {
+fn start_sender(state_machine: Arc<TcpStateMachine>) {
 
-    let state_machine_clone = Arc::clone(&state_machine);
+    let sm_clone = Arc::clone(&state_machine);
 
     tokio::spawn(async move {
         loop {
-            let mut sm_guard = state_machine_clone.lock().await;
+            let mut write_buffer = sm_clone.write_buffer.lock().await;
 
-            while !sm_guard.write_buffer.is_empty() && sm_guard.rcv_wnd > 0 {
+            while !write_buffer.is_empty() && sm_clone.rcv_wnd > 0 {
 
-                let send_size = (sm_guard.mss as u32)
-                    .min(sm_guard.rcv_wnd)
-                    .min(sm_guard.write_buffer.len() as u32) as usize;
+                let send_size = (sm_clone.mss as u32)
+                    .min(sm_clone.rcv_wnd)
+                    .min(write_buffer.len() as u32) as usize;
 
                 if send_size == 0 { break; }
 
-                let send_data: Vec<u8> = sm_guard.write_buffer.drain(0..send_size).collect();
+                let send_data: Vec<u8> = write_buffer.drain(0..send_size).collect();
 
-                let is_last = sm_guard.write_buffer.is_empty();
+                let is_last = write_buffer.is_empty();
 
-                sm_guard.wnd_size = sm_guard.wnd_size.saturating_sub(send_size as u32);
-                let win_size = (sm_guard.wnd_size >> sm_guard.wnd_scl) as u16;
+                let win_size = sm_clone.wnd_size.fetch_update(Ordering::SeqCst,  Ordering::SeqCst, |current| {
+                    Some(current.saturating_sub(send_size as u32))
+                }).unwrap();
+
+                let win_size = (win_size >> sm_clone.wnd_scl) as u16;
 
                 let raw_packet = get_ack_data_response(
-                    sm_guard.snd_ack,
-                    sm_guard.destination_addr,
-                    sm_guard.destination_port,
+                    sm_clone.snd_ack,
+                    sm_clone.destination_addr,
+                    sm_clone.destination_port,
                     send_data.clone(),
                     is_last,
-                    sm_guard.snd_seq,
-                    sm_guard.source_addr,
-                    sm_guard.source_port,
-                    sm_guard.rcv_timestamp,
+                    sm_clone.snd_seq.load(Ordering::Relaxed),
+                    sm_clone.source_addr,
+                    sm_clone.source_port,
+                    sm_clone.rcv_timestamp,
                     win_size,
                 ).unwrap();
 
-                if let Err(e) = send_response(&raw_packet, &sm_guard.socket, sm_guard.socket_addr).await {
+                if let Err(e) = send_response(&raw_packet, &sm_clone.socket, sm_clone.socket_addr).await {
                     error!("Failed to send response {}", e);
                     continue;
                 }
 
-                sm_guard.snd_seq = sm_guard.snd_seq.wrapping_add(send_size as u32);
+                sm_clone.snd_seq.fetch_update(Ordering::SeqCst,  Ordering::SeqCst, |current| {
+                    Some(current.wrapping_add(send_size as u32))
+                });
             }
+
+            drop(write_buffer);
 
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
