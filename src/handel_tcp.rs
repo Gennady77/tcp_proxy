@@ -62,6 +62,4 @@ pub async fn handle_tcp() -> Result<(), Box<dyn Error>> {
             };
         });
     }
-
-    Ok(())
 }

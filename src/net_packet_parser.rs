@@ -1,8 +1,7 @@
 use core::fmt;
 use std::{fmt::Display, net::{Ipv4Addr, Ipv6Addr}, time::{SystemTime, UNIX_EPOCH}};
 
-use etherparse::{IpHeaders, IpNumber, NetSlice, PacketBuilder, PacketBuilderStep, SlicedPacket, TcpHeader, TcpOptionElement, TcpOptions, TransportSlice, err::io};
-use rand::Rng;
+use etherparse::{IpNumber, NetSlice, PacketBuilder, SlicedPacket, TcpOptionElement, TransportSlice};
 use tracing::{debug, error};
 
 pub type RawIpPacket = Vec<u8>;
@@ -112,12 +111,9 @@ pub struct Icmpv4Packet {}
 
 pub struct Icmpv6Packet {}
 
-pub struct UdpPacket {
-    pub payload: Vec<u8>
-}
+pub struct UdpPacket {}
 
 pub trait IpTcpPacket {
-    fn build_ip_packet(&self) -> PacketBuilderStep<IpHeaders>;
     fn source_socket_addr(&self) -> String;
     fn destination_socket_addr(&self) -> String;
     fn sequence_number(&self) -> u32;
@@ -128,8 +124,8 @@ pub trait IpTcpPacket {
     fn syn(&self) -> bool;
     fn ack(&self) -> bool;
     fn psh(&self) -> bool;
-    fn rst(&self) -> bool;
-    fn fin(&self) -> bool;
+    fn _rst(&self) -> bool;
+    fn _fin(&self) -> bool;
     fn options(&self) -> TcpPacketOptions;
     fn payload(&self) -> Vec<u8>;
     fn tcp(&self) -> TcpPacket;
@@ -142,14 +138,6 @@ pub struct Ipv4TcpPacket {
 }
 
 impl IpTcpPacket for Ipv4TcpPacket {
-    fn build_ip_packet(&self) -> PacketBuilderStep<IpHeaders> {
-        PacketBuilder::
-        ipv4(
-            self.ip.destination_address.octets(),
-            self.ip.source_address.octets(),
-            64
-        )
-    }
     fn source_socket_addr(&self) -> String {
         format!("{}:{}", self.ip.source_address, self.tcp.source_port)
     }
@@ -180,10 +168,10 @@ impl IpTcpPacket for Ipv4TcpPacket {
     fn psh(&self) -> bool {
         self.tcp.psh
     }
-    fn rst(&self) -> bool {
+    fn _rst(&self) -> bool {
         self.tcp.rst
     }
-    fn fin(&self) -> bool {
+    fn _fin(&self) -> bool {
         self.tcp.fin
     }
     fn payload(&self) -> Vec<u8> {
@@ -216,14 +204,6 @@ pub struct Ipv6TcpPacket {
 }
 
 impl<'a> IpTcpPacket for Ipv6TcpPacket {
-    fn build_ip_packet(&self) -> PacketBuilderStep<IpHeaders> {
-        PacketBuilder::
-        ipv6(
-            self.ip.destination_addr.octets(),
-            self.ip.source_addr.octets(),
-            64
-        )
-    }
     fn destination_socket_addr(&self) -> String {
         format!("[{}]:{}", self.ip.destination_addr, self.tcp.destination_port)
     }
@@ -254,10 +234,10 @@ impl<'a> IpTcpPacket for Ipv6TcpPacket {
     fn psh(&self) -> bool {
         self.tcp.psh
     }
-    fn rst(&self) -> bool {
+    fn _rst(&self) -> bool {
         self.tcp.rst
     }
-    fn fin(&self) -> bool {
+    fn _fin(&self) -> bool {
         self.tcp.fin
     }
     fn options(&self) -> TcpPacketOptions {
@@ -357,8 +337,8 @@ pub fn get_ack_response(
             64
         )
         .tcp(
-            destination_port,
             source_port,
+            destination_port,
             seq_num,
             win_size,
         )
@@ -424,6 +404,52 @@ pub fn get_ack_data_response(
     builder_with_options.write(&mut buffer, &payload).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })?;
+
+    Ok(buffer)
+}
+
+pub fn get_reset_response(
+    ack_num: u32,
+    destination_addr: Ipv4Addr,
+    destination_port: u16,
+    seq_num: u32,
+    source_addr: Ipv4Addr,
+    source_port: u16,
+    timestamp: u32,
+    win_size: u16,
+) -> Result<RawIpPacket, std::io::Error> {
+    let curr_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32;
+
+    let options = vec![
+        TcpOptionElement::Timestamp(curr_timestamp, timestamp)
+    ];
+
+    let builder = PacketBuilder::
+        ipv4(
+            source_addr.octets(),
+            destination_addr.octets(),
+            64
+        )
+        .tcp(
+            source_port,
+            destination_port,
+            seq_num,
+            win_size,
+        )
+        .rst()
+        .ack(ack_num);
+
+    let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+
+    let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(0));
+    let payload = Vec::<u8>::new();
+
+    builder_with_options.write(&mut buffer, &payload).unwrap();
 
     Ok(buffer)
 }
@@ -513,10 +539,8 @@ pub fn net_packet_parser(raw_ip_packet: &[u8]) -> Option<Packet> {
                 Some(TransportSlice::Icmpv6(_icmpv6_slice)) => {
                     TransportPacket::Icmpv6(Icmpv6Packet {})
                 },
-                Some(TransportSlice::Udp(udp_slice)) => {
-                    TransportPacket::Udp(UdpPacket {
-                        payload: udp_slice.payload().to_vec()
-                    })
+                Some(TransportSlice::Udp(_udp_slice)) => {
+                    TransportPacket::Udp(UdpPacket {})
                 },
                 None => TransportPacket::Unknown
             };
@@ -527,7 +551,7 @@ pub fn net_packet_parser(raw_ip_packet: &[u8]) -> Option<Packet> {
                         ip: ipv4_packet,
                         tcp: tcp_packet,
                     }),
-                (NetPacket::Ipv4(ipv4_packet), TransportPacket::Udp(udp_packet)) => {
+                (NetPacket::Ipv4(_ipv4_packet), TransportPacket::Udp(_udp_packet)) => {
                     debug!("================ ipv4/udp packet");
 
                     Packet::Unknown
