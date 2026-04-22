@@ -123,8 +123,6 @@ impl AsyncRead for ReadHalf {
                     return Poll::Pending;
                 }
 
-                debug!("AsyncRead poll_read read_buffer got lock. rb len {}", rb.len());
-
                 let available = rb.len();
                 let to_read = min(available, buf.remaining());
 
@@ -225,7 +223,6 @@ impl TcpActor {
                     self.state.process_event(packet).await?;
 
                     if !self.state.read_buffer.is_empty() {
-                        debug!("TcpActor run TcpCommand::Packet read_buffer is not empty. rcv_wnd {}", self.state.rcv_wnd);
                         let data = std::mem::take(&mut self.state.read_buffer);
                         let _ = self.read_tx.send(TcpActorEvent::Data(data));
                     }
@@ -669,9 +666,9 @@ impl IpOverUdpServer {
                 loop {
                     match read_rx.recv().await {
                         Some(TcpActorEvent::Data(mut data)) => {
-                            let mut rb = stream_cloned.read_buffer.lock().await;
+                            debug!("handle_ipv4_tcp_packet tokio::spawn read_rx.recv() TcpActorEvent::Data. data.len {}", data.len());
 
-                            debug!("handle_ipv4_tcp_packet tokio::spawn read_rx.recv() rb appended. data.len {}", data.len());
+                            let mut rb = stream_cloned.read_buffer.lock().await;
 
                             rb.append(&mut data);
 
@@ -802,5 +799,41 @@ pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr};
+
+    use rand::Rng;
+    use tokio::net::TcpListener;
+
+    use crate::{handle_udp::IpOverUdpServer, net_packet_parser::{Ipv4Packet, Ipv4TcpPacket, TcpPacket}};
+
+    #[tokio::test]
+    async fn test_syn() {
+        let mut rng = rand::rng();
+        let mut client_server = IpOverUdpServer::new("127.0.0.1:0").await.unwrap();
+        let destination_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let client_addr = client_server.socket.local_addr().unwrap();
+
+        let destination_addr = Ipv4Addr::new(127, 0, 0, 1);
+        let destination_port = destination_server.local_addr().unwrap().port();
+        let seq_num = rng.next_u32();
+        let source_addr = Ipv4Addr::new(127, 0, 0, 1);
+        let source_port = client_server.socket.local_addr().unwrap().port();
+
+        let packet = Ipv4TcpPacket::syn_packet(
+            destination_addr,
+            destination_port,
+            seq_num,
+            source_addr,
+            source_port,
+            65535
+        ).unwrap();
+
+        let stream = client_server.handle_ipv4_tcp_packet(packet, client_addr).await;
     }
 }

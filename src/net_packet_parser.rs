@@ -78,11 +78,6 @@ pub struct TcpPacket{
     pub destination_port: u16,
     pub sequence_number: u32,
     pub acknowledgment_number: u32,
-    pub ack: bool,
-    pub psh: bool,
-    pub rst: bool,
-    pub syn: bool,
-    pub fin: bool,
     pub window_size: u16,
     pub payload: Vec<u8>,
     pub options: TcpPacketOptions,
@@ -94,11 +89,11 @@ impl<'a> Display for TcpPacket {
         write!(f, "seqNum {}, ackNum {}, ack {}, psh {}, rst {}, syn {}, fin {}, wnd {}, payloadLen {}, options: [{}], payload {:?}",
             self.sequence_number,
             self.acknowledgment_number,
-            self.ack,
-            self.psh,
-            self.rst,
-            self.syn,
-            self.fin,
+            self.flags.ack,
+            self.flags.psh,
+            self.flags.rst,
+            self.flags.syn,
+            self.flags.fin,
             self.window_size,
             self.payload.len(),
             self.options,
@@ -137,6 +132,37 @@ pub struct Ipv4TcpPacket {
     pub tcp: TcpPacket,
 }
 
+impl Ipv4TcpPacket {
+    pub fn syn_packet(
+        destination_addr: Ipv4Addr,
+        destination_port: u16,
+        seq_num: u32,
+        source_addr: Ipv4Addr,
+        source_port: u16,
+        win_size: u16,
+    ) -> Result<Self, std::io::Error> {
+        let raw_packet = get_syn_response(
+            destination_addr,
+            destination_port,
+            seq_num,
+            source_addr,
+            source_port,
+            win_size,
+        )?;
+
+        match net_packet_parser(&raw_packet) {
+            Some(Packet::Ipv4Tcp(packet)) => Ok(packet),
+            Some(_) => {
+                error!("Failed to create ipv4 syn packet");
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to create ipv4 syn packet"))
+            },
+            None => {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to create ipv4 syn packet"))
+            }
+        }
+    }
+}
+
 impl IpTcpPacket for Ipv4TcpPacket {
     fn source_socket_addr(&self) -> String {
         format!("{}:{}", self.ip.source_address, self.tcp.source_port)
@@ -160,19 +186,19 @@ impl IpTcpPacket for Ipv4TcpPacket {
         self.tcp.window_size
     }
     fn syn(&self) -> bool {
-        self.tcp.syn
+        self.tcp.flags.syn
     }
     fn ack(&self) -> bool {
-        self.tcp.ack
+        self.tcp.flags.ack
     }
     fn psh(&self) -> bool {
-        self.tcp.psh
+        self.tcp.flags.psh
     }
     fn _rst(&self) -> bool {
-        self.tcp.rst
+        self.tcp.flags.rst
     }
     fn _fin(&self) -> bool {
-        self.tcp.fin
+        self.tcp.flags.fin
     }
     fn payload(&self) -> Vec<u8> {
         self.tcp.payload.clone()
@@ -226,19 +252,19 @@ impl<'a> IpTcpPacket for Ipv6TcpPacket {
         self.tcp.destination_port
     }
     fn syn(&self) -> bool {
-        self.tcp.syn
+        self.tcp.flags.syn
     }
     fn ack(&self) -> bool {
-        self.tcp.ack
+        self.tcp.flags.ack
     }
     fn psh(&self) -> bool {
-        self.tcp.psh
+        self.tcp.flags.psh
     }
     fn _rst(&self) -> bool {
-        self.tcp.rst
+        self.tcp.flags.rst
     }
     fn _fin(&self) -> bool {
-        self.tcp.fin
+        self.tcp.flags.fin
     }
     fn options(&self) -> TcpPacketOptions {
         self.tcp.options
@@ -307,6 +333,37 @@ pub fn get_handshake_response(
     let payload = Vec::<u8>::new();
 
     builder_with_options.write(&mut buffer, &payload).unwrap();
+
+    Ok(buffer)
+}
+
+pub fn get_syn_response(
+    destination_addr: Ipv4Addr,
+    destination_port: u16,
+    seq_num: u32,
+    source_addr: Ipv4Addr,
+    source_port: u16,
+    win_size: u16,
+) -> Result<RawIpPacket, std::io::Error> {
+    let builder = PacketBuilder::
+        ipv4(
+            source_addr.octets(),
+            destination_addr.octets(),
+            64
+        )
+        .tcp(
+            source_port,
+            destination_port,
+            seq_num,
+            win_size,
+        )
+        .syn();
+
+    let payload = Vec::<u8>::new();
+
+    let mut buffer = Vec::<u8>::with_capacity(builder.size(payload.len()));
+
+    builder.write(&mut buffer, &payload).unwrap();
 
     Ok(buffer)
 }
@@ -516,11 +573,6 @@ pub fn net_packet_parser(raw_ip_packet: &[u8]) -> Option<Packet> {
                         destination_port: tcp_slice.destination_port(),
                         sequence_number: tcp_slice.sequence_number(),
                         acknowledgment_number: tcp_slice.acknowledgment_number(),
-                        ack: tcp_slice.ack(),
-                        psh: tcp_slice.psh(),
-                        rst: tcp_slice.rst(),
-                        syn: tcp_slice.syn(),
-                        fin: tcp_slice.fin(),
                         window_size: tcp_slice.window_size(),
                         options: tcp_options,
                         payload: tcp_slice.payload().to_vec(),

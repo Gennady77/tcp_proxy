@@ -14,12 +14,12 @@ pub async fn handle_tcp() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move {
             let mut buffer = [0u8; 1024];
 
-            let _n = match client_stream.read(&mut buffer).await {
+            match client_stream.read(&mut buffer).await {
                 Ok(0) => {
                     error!("Connection was closed");
                 }
-                Ok(_n) => {
-                    debug!("Received from {}: {}", addr, String::from_utf8_lossy(&buffer));
+                Ok(n) => {
+                    debug!("Received from {}, {} bytes", addr, n);
 
                     if buffer.starts_with(b"=====") {
                         let request = String::from_utf8_lossy(&buffer);
