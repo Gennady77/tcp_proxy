@@ -1,19 +1,23 @@
-use tokio::{io::{AsyncRead, AsyncWrite, copy}, net::{TcpStream, UdpSocket}, sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel}}, time::sleep};
-use tracing::{debug, error, warn};
-use std::{cmp::min, collections::{BTreeMap, HashMap, VecDeque}, error::Error, fmt::Display, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, task::{Poll, Waker}, time::Duration};
+use tokio::{io::{AsyncRead, AsyncWrite, copy}, net::{TcpStream, UdpSocket}, sync::Mutex, time::sleep};
+use tracing::{debug, error, info, warn};
+use std::{cmp::min, collections::HashMap, error::Error, net::{SocketAddr, SocketAddrV4}, task::{Poll, Waker}, time::Duration};
 use rand::Rng;
 use std::sync::Arc;
 
-use crate::net_packet_parser::{IpTcpPacket, Ipv4TcpPacket, Packet, RawIpPacket, TcpFlags, TcpPacket, get_ack_data_response, get_ack_response, get_handshake_response, get_reset_response, net_packet_parser};
+use crate::{net_packet_parser::{IpTcpPacket, Ipv4TcpPacket, Packet, get_reset_response, net_packet_parser}, tcp_actor::{TcpActor, TcpActorEvent, TcpHandle}, utils::dump_raw_packet};
 
 struct ReadHalf {
     buffer: Arc<Mutex<Vec<u8>>>,
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
-struct WriteHalf(Arc<Mutex<Vec<u8>>>);
+struct WriteHalf{
+    buffer: Arc<Mutex<Vec<u8>>>,
+    closed: Arc<Mutex<bool>>
+}
 
 struct IpUdpStream {
+    closed: Arc<Mutex<bool>>,
     destination_socket_addr: SocketAddr,
     handle: TcpHandle,
     read_buffer: Arc<Mutex<Vec<u8>>>,
@@ -27,6 +31,7 @@ impl IpUdpStream {
         handle: TcpHandle,
     ) -> Self {
         Self {
+            closed: Arc::new(Mutex::new(false)),
             destination_socket_addr,
             handle,
             read_buffer: Arc::new(Mutex::new(Vec::new())),
@@ -46,7 +51,18 @@ impl IpUdpStream {
             waker: read_waker,
         };
 
-        (read_half, WriteHalf(write_buffer))
+        let write_half = WriteHalf {
+            buffer: write_buffer,
+            closed: self.closed.clone()
+        };
+
+        (read_half, write_half)
+    }
+
+    pub async fn is_closed(&self) -> bool {
+        let closed_guard = self.closed.lock().await;
+
+        *closed_guard
     }
 }
 
@@ -57,13 +73,20 @@ impl AsyncWrite for WriteHalf {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let write_buffer = this.0.clone();
+        let write_buffer = this.buffer.clone();
+
+        let closed = match this.closed.try_lock() {
+            Ok(cls) => *cls,
+            Err(_) => return Poll::Pending
+        };
+
+        if closed {
+            return Poll::Ready(Ok(0));
+        }
 
         match write_buffer.try_lock() {
             Ok(mut wb) => {
                 let bytes_to_write = buf.len();
-
-                debug!("AsyncWrite poll_write write_buffer extend. buf len {}", buf.len());
 
                 wb.extend_from_slice(buf);
 
@@ -75,7 +98,7 @@ impl AsyncWrite for WriteHalf {
 
     fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let write_buffer = this.0.clone();
+        let write_buffer = this.buffer.clone();
 
         match write_buffer.try_lock() {
             Ok(wb) => {
@@ -151,408 +174,6 @@ impl AsyncRead for ReadHalf {
     }
 }
 
-enum TcpCommand {
-    Packet(Ipv4TcpPacket),
-    Write(Vec<u8>),
-}
-
-enum TcpActorEvent {
-    Data(Vec<u8>)
-}
-
-struct TcpHandle {
-    cmd_tx: UnboundedSender<TcpCommand>,
-}
-
-impl TcpHandle {
-    fn send_packet(&self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
-        if let Err(e) = self.cmd_tx.send(TcpCommand::Packet(packet.clone())) {
-            error!("Failed to send packet {}, {}: {}", packet.destination_socket_addr(), packet.sequence_number(), e);
-        }
-
-        Ok(())
-    }
-
-    fn write(&self, data: Vec<u8>) {
-        let _ = self.cmd_tx.send(TcpCommand::Write(data));
-    }
-}
-
-struct TcpActor {
-    state: TcpStateMachine,
-    cmd_rx: UnboundedReceiver<TcpCommand>,
-    read_tx: UnboundedSender<TcpActorEvent>
-}
-
-impl TcpActor {
-    fn new(
-        socket: Arc<UdpSocket>,
-        socket_addr: SocketAddr,
-        source_addr: Ipv4Addr,
-        source_port: u16,
-        destination_addr: Ipv4Addr,
-        destination_port: u16,
-    ) -> (TcpHandle, UnboundedReceiver<TcpActorEvent>, Self) {
-        let (cmd_tx, cmd_rx) = unbounded_channel();
-        let (read_tx, read_rx) = unbounded_channel();
-
-        let mut state = TcpStateMachine::new(
-            socket,
-            socket_addr,
-            source_addr,
-            source_port,
-            destination_addr,
-            destination_port,
-        );
-
-        state.state = TcpState::Listen;
-
-        let actor = Self {
-            state,
-            cmd_rx,
-            read_tx,
-        };
-
-        (TcpHandle { cmd_tx }, read_rx, actor )
-    }
-
-    async fn run(&mut self) -> Result<(), std::io::Error> {
-        while let Some(cmd) = self.cmd_rx.recv().await {
-            match cmd {
-                TcpCommand::Packet(packet) => {
-                    self.state.process_event(packet).await?;
-
-                    if !self.state.read_buffer.is_empty() {
-                        let data = std::mem::take(&mut self.state.read_buffer);
-                        let _ = self.read_tx.send(TcpActorEvent::Data(data));
-                    }
-                }
-                TcpCommand::Write(data) => {
-                    debug!("TcpActor run TcpCommand::Write. data len {}", data.len());
-
-                    self.state.try_send_data(data).await;
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy)]
-enum TcpState {
-    Close,
-    Listen,
-    SynReceived,
-    Established,
-}
-
-impl Display for TcpState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TcpState::Close => write!(f, "Close"),
-            TcpState::Listen => write!(f, "Listen"),
-            TcpState::SynReceived => write!(f, "SynReceived"),
-            TcpState::Established => write!(f, "Established"),
-        }
-    }
-}
-
-#[derive(Clone)]
-enum TcpEvent {
-    DataArrives,
-    SegmentArrives(TcpFlags),
-    RstArrives,
-    Unknown,
-}
-
-impl Display for TcpEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TcpEvent::DataArrives => write!(f, "DataArrives"),
-            TcpEvent::RstArrives => write!(f, "RstArrives"),
-            TcpEvent::SegmentArrives(flags) => write!(f, "SegmentArrives(syn={}, psh={}, ack={}, fin={}, rst={})", flags.syn, flags.psh, flags.ack, flags.fin, flags.rst),
-            TcpEvent::Unknown => write!(f, "Unknown"),
-        }
-    }
-}
-
-struct TcpStateMachine {
-    app_buffer: VecDeque<u8>,
-    destination_addr: Ipv4Addr,
-    destination_port: u16,
-    mss: u16,
-    out_of_order_buffer: BTreeMap<u32, Vec<u8>>,
-    rcv_ack: u32,
-    rcv_seq: u32,
-    rcv_seq_next: u32,
-    rcv_timestamp: u32,
-    rcv_wnd: u32,
-    read_buffer: Vec<u8>,
-    snd_ack: u32,
-    snd_seq: u32,
-    socket: Arc<UdpSocket>,
-    socket_addr: SocketAddr,
-    source_addr: Ipv4Addr,
-    source_port: u16,
-    state: TcpState,
-    wnd_scl: u8,
-    wnd_size: u32,
-}
-
-impl TcpStateMachine {
-    fn new(
-        socket: Arc<UdpSocket>,
-        socket_addr: SocketAddr,
-        source_addr: Ipv4Addr,
-        source_port: u16,
-        destination_addr: Ipv4Addr,
-        destination_port: u16,
-    ) -> Self {
-        let mut rng = rand::rng();
-
-        let sm = Self {
-            app_buffer: VecDeque::new(),
-            destination_addr,
-            destination_port,
-            mss: 65535,
-            out_of_order_buffer: BTreeMap::new(),
-            rcv_ack: 0,
-            rcv_seq: 0,
-            rcv_seq_next: 0,
-            rcv_timestamp: 0,
-            rcv_wnd: 0,
-            read_buffer: Vec::new(),
-            snd_ack: 0,
-            snd_seq: rng.next_u32(),
-            socket,
-            socket_addr,
-            source_addr,
-            source_port,
-            state: TcpState::Close,
-            wnd_scl: 0,
-            wnd_size: 0,
-        };
-
-        sm
-    }
-
-    async fn send_syn_ack_packet(&self) -> Result<(), std::io::Error> {
-        let wnd_size = (self.wnd_size >> self.wnd_scl) as u16;
-
-        let syn_ack_packet = get_handshake_response(
-            self.snd_ack,
-            self.source_addr,
-            self.source_port,
-            self.mss,
-            self.snd_seq,
-            self.destination_addr,
-            self.destination_port,
-            self.rcv_timestamp,
-            self.wnd_scl,
-            wnd_size,
-        )?;
-
-        send_response(&syn_ack_packet, &self.socket, self.socket_addr).await?;
-
-        Ok(())
-    }
-
-    async fn handle_data_in_established(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
-        let seq_num = packet.sequence_number();
-        let data = packet.payload();
-
-        if seq_num == self.rcv_seq_next {
-            self.process_in_order_data(packet).await?;
-        } else if seq_num > self.rcv_seq_next {
-            self.buffer_out_of_order_data(seq_num, data);
-        } else {
-            warn!("Duplicate unordered segment from the past {} (seq_num={} < rcv_seq_next={})", packet.destination_socket_addr(), seq_num, self.rcv_seq_next);
-            self.send_ack().await?;
-        }
-
-        Ok(())
-    }
-
-    async fn process_in_order_data(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
-        let data = packet.payload();
-        let push_flag = packet.psh();
-
-        debug!("===process_in_order_data==== {} {} psh {}", packet.destination_socket_addr(), self.app_buffer.len(), push_flag);
-
-        self.app_buffer.extend(data.as_slice());
-
-        self.drain_out_of_order_buffer();
-
-        if push_flag {
-            self.send_ack().await?;
-
-            let data_buff: Vec<u8> = self.app_buffer.drain(..self.app_buffer.len()).collect();
-
-            self.read_buffer.extend(data_buff);
-        }
-        Ok(())
-    }
-
-    async fn send_ack(&self) -> Result<(), std::io::Error> {
-        let wnd_size = (self.wnd_size >> self.wnd_scl) as u16;
-
-        let raw_response = get_ack_response(
-            self.snd_ack, 
-            self.source_addr, 
-            self.source_port,
-            self.snd_seq, 
-            self.destination_addr,
-            self.destination_port,
-            self.rcv_timestamp,
-            wnd_size,
-        )?;
-
-        send_response(&raw_response, &self.socket, self.socket_addr).await?;
-
-        Ok(())
-    }
-
-    fn drain_out_of_order_buffer(&mut self) {
-        let mut next_seq = self.rcv_seq;
-
-        while let Some(data) = self.out_of_order_buffer.remove(&next_seq) {
-            self.app_buffer.extend(data.as_slice());
-            next_seq = next_seq.wrapping_add(data.len() as u32);
-        }
-
-        if next_seq != self.rcv_seq {
-            self.rcv_seq = next_seq;
-        }
-    }
-
-    fn buffer_out_of_order_data(&mut self, seq_num: u32, data: Vec<u8>) {
-        if !self.out_of_order_buffer.contains_key(&seq_num) {
-            self.out_of_order_buffer.insert(seq_num, data);
-        } else {
-            warn!("Duplicate unordered segment SEQ={}", seq_num);
-        }
-    }
-
-    async fn process_event(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
-        let old_state = self.state;
-
-        let event = packet_to_event(packet.tcp());
-
-        match (old_state, event.clone()) {
-            (TcpState::Listen, TcpEvent::SegmentArrives(flags)) if flags.syn && !flags.ack => {
-                self.mss = packet.options().mss.min(self.mss);
-                self.wnd_scl = packet.options().window_scale;
-                self.wnd_size = (65535) << self.wnd_scl;
-                self.rcv_seq = packet.sequence_number();
-                self.rcv_ack = packet.acknowledgment_number();
-                self.rcv_wnd = (packet.window_size() as u32) << self.wnd_scl;
-                self.rcv_timestamp = packet.options().timestamp.0;
-                self.snd_ack = self.rcv_seq.wrapping_add(1);
-
-                self.send_syn_ack_packet().await?;
-
-                self.rcv_seq_next = self.rcv_seq.wrapping_add(1);
-                self.snd_seq = self.snd_seq.wrapping_add(1);
-
-                self.state = TcpState::SynReceived;
-            }
-            (TcpState::SynReceived, TcpEvent::SegmentArrives(flags)) if !flags.syn && flags.ack => {
-                self.rcv_seq = packet.sequence_number();
-                self.rcv_ack = packet.acknowledgment_number();
-                self.rcv_wnd = (packet.window_size() as u32) << self.wnd_scl;
-                self.rcv_timestamp = packet.options().timestamp.0;
-                self.state = TcpState::Established;
-            }
-            (TcpState::Established, TcpEvent::DataArrives) => {
-                self.rcv_seq = packet.sequence_number();
-                self.rcv_ack = packet.acknowledgment_number();
-                self.rcv_timestamp = packet.options().timestamp.0;
-                self.snd_ack = self.rcv_seq.wrapping_add(packet.payload().len() as u32);
-                self.wnd_size = self.wnd_size.wrapping_sub(packet.payload().len() as u32);
-                self.rcv_wnd = (packet.window_size() as u32) << self.wnd_scl;
-
-                self.handle_data_in_established(packet.clone()).await?;
-
-                self.rcv_seq_next = self.rcv_seq.wrapping_add(packet.payload().len() as u32);
-            }
-            (TcpState::Established, TcpEvent::SegmentArrives(flags)) if !flags.syn && flags.ack => {
-                self.rcv_seq = packet.sequence_number();
-                self.rcv_ack = packet.acknowledgment_number();
-                self.rcv_timestamp = packet.options().timestamp.0;
-
-                debug!("Data confirmation processing {} ack_num {}", packet.destination_socket_addr(), packet.acknowledgment_number());
-            }
-            (_, TcpEvent::RstArrives) => {
-                warn!("process_event TcpEvent::RstArrives {} {}", packet.destination_socket_addr(), packet.sequence_number());
-
-                self.state = TcpState::Close;
-            },
-            (_, TcpEvent::Unknown) => {
-                warn!("++++++ process_event TcpEvent::Unknown");
-            }
-            _ => {
-                error!("Invalid state/event combination event {}, state {}", event, old_state);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Invalid state/event combination"
-                ));
-            }
-        };
-
-        Ok(())
-    }
-
-    async fn try_send_data(&mut self, mut data: Vec<u8>) {
-        debug!("TcpStateMachine try_send_data. data len {}, rcv_win {}", data.len(), self.rcv_wnd);
-
-        while !data.is_empty() && self.rcv_wnd > 0 {
-
-            let send_size = (self.mss as u32)
-                .min(self.rcv_wnd)
-                .min(data.len() as u32) as usize;
-
-            if send_size == 0 { break; }
-
-            let send_data: Vec<u8> = data.drain(0..send_size).collect();
-
-            let is_last = data.is_empty();
-
-            let raw_packet = get_ack_data_response(
-                self.snd_ack,
-                self.source_addr,
-                self.source_port,
-                send_data.clone(),
-                is_last,
-                self.snd_seq,
-                self.destination_addr,
-                self.destination_port,
-                self.rcv_timestamp,
-                65535,
-            ).unwrap();
-
-            if let Err(e) = send_response(&raw_packet, &self.socket, self.socket_addr).await {
-                error!("Failed to send response {}", e);
-                continue;
-            }
-
-            self.snd_seq = self.snd_seq.wrapping_add(send_size as u32);
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
-}
-
-fn packet_to_event(packet: TcpPacket) -> TcpEvent {
-    match packet {
-        p if !p.payload.is_empty() => TcpEvent::DataArrives,
-        p if p.flags.rst => TcpEvent::RstArrives,
-        p if p.flags.fin => TcpEvent::SegmentArrives(p.flags),
-        p if p.payload.is_empty() => TcpEvent::SegmentArrives(p.flags),
-        _ => TcpEvent::Unknown,
-    }
-}
-
 struct IpOverUdpServer {
     socket: Arc<UdpSocket>,
     conections: HashMap<(String, String), Arc<IpUdpStream>>,
@@ -568,34 +189,48 @@ impl IpOverUdpServer {
         })
     }
 
-    async fn run(&mut self) -> Result<Arc<IpUdpStream>, Box<dyn Error>>{
+    async fn run(&mut self) -> Result<Arc<IpUdpStream>, Box<dyn Error>> {
         loop {
-            let mut buffer = [0u8; 65535];
-
-            let socket_cloned = Arc::clone(&self.socket);
-
-            match socket_cloned.recv_from(&mut buffer).await {
-                Ok((n, socket_addr)) => {
-                    debug!("===== Received {} from {}", n, socket_addr);
-
-                    let raw_ip_packet = buffer[..n].to_vec();
-
-                    match self.handle_ip_packet(raw_ip_packet, socket_addr).await {
-                        Ok(Some(stream)) => {
-                            return Ok(stream);
-                        },
-                        Ok(None) => continue,
-                        Err(e) => {
-                            error!("Handle ip packet error {e}");
-                            continue;
-                        }
-                    };
+            match self.recv().await {
+                Ok(Some(stream)) => {
+                    return Ok(stream);
                 },
-                Err(e) => {
-                    error!("Recieve socket error: {}", e);
-                }
+                Ok(None) => continue,
+                Err(_) => continue,
             }
         }
+    }
+
+    async fn recv(&mut self) -> Result<Option<Arc<IpUdpStream>>, Box<dyn Error>> {
+        let mut buffer = [0u8; 65535];
+
+        let socket_cloned = Arc::clone(&self.socket);
+
+        match socket_cloned.recv_from(&mut buffer).await {
+            Ok((n, socket_addr)) => {
+                debug!("===== Received {} from {}", n, socket_addr);
+
+                let raw_ip_packet = buffer[..n].to_vec();
+
+                match self.handle_ip_packet(raw_ip_packet, socket_addr).await {
+                    Ok(Some(stream)) => {
+                        return Ok(Some(stream));
+                    },
+                    Ok(None) => {
+                        return Ok(None);
+                    },
+                    Err(e) => {
+                        error!("Handle ip packet error {e}");
+                        return Err(e);
+                    }
+                };
+            },
+            Err(e) => {
+                error!("Recieve socket error: {}", e);
+            }
+        };
+
+        Ok(None)
     }
 
     async fn handle_ip_packet<'a>(
@@ -652,8 +287,6 @@ impl IpOverUdpServer {
                 )
             );
 
-            actor.state.process_event(packet.clone()).await?;
-
             tokio::spawn(async move {
                 if let Err(e) = actor.run().await {
                     error!("Failed to raun actor {}", e);
@@ -666,8 +299,6 @@ impl IpOverUdpServer {
                 loop {
                     match read_rx.recv().await {
                         Some(TcpActorEvent::Data(mut data)) => {
-                            debug!("handle_ipv4_tcp_packet tokio::spawn read_rx.recv() TcpActorEvent::Data. data.len {}", data.len());
-
                             let mut rb = stream_cloned.read_buffer.lock().await;
 
                             rb.append(&mut data);
@@ -680,6 +311,13 @@ impl IpOverUdpServer {
                                 waker.wake();
                             }
                         },
+                        Some(TcpActorEvent::Close) => {
+                            let mut closed_guard = stream_cloned.closed.lock().await;
+
+                            *closed_guard = true;
+
+                            break;
+                        },
                         None => {
                             break;
                         }
@@ -691,6 +329,10 @@ impl IpOverUdpServer {
 
             tokio::spawn(async move {
                 loop {
+                    if stream_cloned.is_closed().await {
+                        break;
+                    }
+
                     let mut wb = stream_cloned.write_buffer.lock().await;
 
                     if !wb.is_empty() {
@@ -709,7 +351,9 @@ impl IpOverUdpServer {
 
             self.conections.insert(key, stream.clone());
 
-            return Ok(Some(stream.clone()));
+            stream.handle.send_packet(packet.clone())?;
+
+            return Ok(Some(stream));
         }
 
         let key = (packet.source_socket_addr(), packet.destination_socket_addr());
@@ -751,35 +395,18 @@ async fn send_response(
         return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
     }
 
-    dump_raw_packet(response_raw, "+++++ Sent packet to socket");
+    dump_raw_packet(response_raw, "Sent");
 
     return Ok(())
 }
 
-fn dump_raw_packet(raw_packet: &RawIpPacket, prefix: &str) {
-    match net_packet_parser(&raw_packet) {
-        Some(Packet::Ipv4Tcp(parsed_response)) => {
-            debug!("{} Ipv4Tcp packet {}", prefix, parsed_response);
-        },
-        Some(Packet::Ipv6Tcp(parsed_response)) => {
-            debug!("{} Ipv6Tcp packet {}", prefix, parsed_response);
-        },
-        Some(Packet::Unknown) => {
-            debug!("Unknown type of raw packet")
-        }
-        None => {
-            debug!("Received response packet from server");
-        }
-    }
-}
-
 pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
+    info!("udp-server is running on port 8200");
+
     let mut server = IpOverUdpServer::new("0.0.0.0:8200").await?;
 
     loop {
         let client_stream = server.run().await?;
-
-        debug!("Got new stream {}", client_stream.destination_socket_addr);
 
         tokio::spawn(async move {
             let addr = client_stream.destination_socket_addr;
@@ -793,47 +420,378 @@ pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
                         _ = copy(&mut read_client, &mut write_destination) => {}
                         _ = copy(&mut read_destination, &mut write_client) => {}
                     }
+
+                    debug!("Stream/client pipe was closed ({})", addr);
                 }
                 Err(e) => {
                     error!("Connection error to target {} : {}", addr, e);
                 }
             }
+
+            debug!("Thread of stream/clent connection was closed ({})", addr);
         });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr};
+    use std::{net::{Ipv4Addr, SocketAddr, SocketAddrV4}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
+    use etherparse::{PacketBuilder, TcpOptionElement};
     use rand::Rng;
-    use tokio::net::TcpListener;
+    use tokio::{net::{TcpListener, UdpSocket}, time::timeout};
 
-    use crate::{handle_udp::IpOverUdpServer, net_packet_parser::{Ipv4Packet, Ipv4TcpPacket, TcpPacket}};
+    use crate::{handle_udp::{IpOverUdpServer, IpUdpStream}, net_packet_parser::{IpTcpPacket, Packet, RawIpPacket, get_ack_data_response, get_ack_response, net_packet_parser}};
+
+    pub fn get_syn_response(
+        destination_addr: &Ipv4Addr,
+        destination_port: u16,
+        seq_num: u32,
+        source_addr: &Ipv4Addr,
+        source_port: u16,
+        win_size: u16,
+    ) -> Result<RawIpPacket, std::io::Error> {
+        let curr_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32;
+
+        let options = vec![
+            TcpOptionElement::MaximumSegmentSize(1350),
+            TcpOptionElement::Timestamp(curr_timestamp, 0)
+        ];
+
+        let builder = PacketBuilder::
+            ipv4(
+                source_addr.octets(),
+                destination_addr.octets(),
+                64
+            )
+            .tcp(
+                source_port,
+                destination_port,
+                seq_num,
+                win_size,
+            )
+            .syn();
+
+        let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?;
+
+        let payload = Vec::<u8>::new();
+
+        let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(payload.len()));
+
+        builder_with_options.write(&mut buffer, &payload).unwrap();
+
+        Ok(buffer)
+    }
+
+    pub fn get_rst_response(
+        destination_addr: Ipv4Addr,
+        destination_port: u16,
+        seq_num: u32,
+        source_addr: Ipv4Addr,
+        source_port: u16,
+    ) -> Result<RawIpPacket, std::io::Error> {
+
+        let builder = PacketBuilder::
+            ipv4(
+                source_addr.octets(),
+                destination_addr.octets(),
+                64
+            )
+            .tcp(
+                source_port,
+                destination_port,
+                seq_num,
+                0,
+            )
+            .rst();
+
+        let payload = Vec::<u8>::new();
+
+        let mut buffer = Vec::<u8>::with_capacity(builder.size(payload.len()));
+
+        builder.write(&mut buffer, &payload).unwrap();
+
+        Ok(buffer)
+    }
+
+    
+    async fn assert_syn(
+        client: &UdpSocket,
+        destination_addr: SocketAddrV4,
+        server: &mut IpOverUdpServer,
+        source_addr: SocketAddrV4,
+    ) -> (Arc<IpUdpStream>, u32, u32, u32) {
+        let mut rng = rand::rng();
+        let mut client_seq_num = rng.next_u32();
+
+        let syn_packet = get_syn_response(
+            destination_addr.ip(),
+            destination_addr.port(),
+            client_seq_num,
+            source_addr.ip(),
+            source_addr.port(),
+            65535,
+        ).unwrap();
+
+        client.send_to(syn_packet.as_slice(), server.socket.local_addr().unwrap()).await.unwrap();
+
+        client_seq_num = client_seq_num.saturating_add(1);
+
+        let Some(stream) = server.recv().await.unwrap() else {
+            panic!("No stream was created");
+        };
+
+        let mut buffer = [0u8; 1024];
+
+        let ack_packet = match timeout(Duration::from_millis(500), client.recv_from(&mut buffer)).await {
+            Ok(Ok((n, _))) => {
+                let Some(Packet::Ipv4Tcp(packet)) = net_packet_parser(&buffer[..n]) else {
+                    panic!("");
+                };
+
+                assert!(packet.tcp.flags.syn);
+                assert!(packet.tcp.flags.ack);
+                assert_eq!(packet.tcp.acknowledgment_number, client_seq_num);
+
+                packet
+            },
+            _ => panic!("No client response received")
+        };
+
+        let server_seq_number = ack_packet.tcp.sequence_number;
+        let server_timestamp = ack_packet.options().timestamp.0;
+
+        (stream, client_seq_num, server_seq_number, server_timestamp)
+    }
+
+    async fn assert_ack(
+        ack_num: u32,
+        client: &UdpSocket,
+        destination_addr: SocketAddrV4,
+        seq_num: u32,
+        server: &mut IpOverUdpServer,
+        source_addr: SocketAddrV4,
+        timestamp: u32,
+    ) {
+        let raw_packet = get_ack_response(
+            ack_num,
+            *destination_addr.ip(),
+            destination_addr.port(),
+            seq_num,
+            *source_addr.ip(),
+            source_addr.port(),
+            timestamp,
+            65535,
+        ).unwrap();
+
+        client.send_to(raw_packet.as_slice(), server.socket.local_addr().unwrap()).await.unwrap();
+
+        server.recv().await.unwrap();
+    }
+
+    async fn assert_data_request(
+        ack_num: u32,
+        client: &UdpSocket,
+        destination_addr: SocketAddrV4,
+        payload: &str,
+        seq_num: u32,
+        server: &mut IpOverUdpServer,
+        source_addr: SocketAddrV4,
+        stream: Arc<IpUdpStream>,
+        timestamp: u32,
+    ) -> u32 {
+        let payload_data = payload.as_bytes().to_vec();
+
+        let raw_packet_data = get_ack_data_response(
+            ack_num,
+            *destination_addr.ip(),
+            destination_addr.port(),
+            payload_data.clone(),
+            true,
+            seq_num,
+            *source_addr.ip(),
+            source_addr.port(),
+            timestamp,
+            65535,
+        ).unwrap();
+
+        client.send_to(raw_packet_data.as_slice(), server.socket.local_addr().unwrap()).await.unwrap();
+
+        let nex_seq_num = seq_num.saturating_add(payload_data.len() as u32);
+
+        server.recv().await.unwrap();
+
+        let mut buffer = [0u8; 1024];
+
+        match timeout(Duration::from_millis(1000), client.recv_from(&mut buffer)).await {
+            Ok(Ok((n, _))) => {
+                let Some(Packet::Ipv4Tcp(packet)) = net_packet_parser(&buffer[..n]) else {
+                    panic!("");
+                };
+
+                assert!(packet.tcp.flags.ack);
+                assert_eq!(packet.tcp.acknowledgment_number, nex_seq_num);
+            },
+            _ => panic!("No client response received")
+        };
+
+        let buffer = stream.read_buffer.lock().await;
+
+        let read_buffer = String::from_utf8_lossy(&buffer);
+
+        assert_eq!(read_buffer, "Hello world".to_string());
+
+        nex_seq_num
+    }
+
+    async fn assert_data_response(
+        client: &UdpSocket,
+        stream: Arc<IpUdpStream>
+    ) {
+        let mut write_buffer = stream.write_buffer.lock().await;
+
+        *write_buffer = "The world is here".as_bytes().to_vec();
+
+        drop(write_buffer);
+
+        let mut buffer = [0u8; 1024];
+
+        match timeout(Duration::from_millis(1000), client.recv_from(&mut buffer)).await {
+            Ok(Ok((n, _))) => {
+                let Some(Packet::Ipv4Tcp(packet)) = net_packet_parser(&buffer[..n]) else {
+                    panic!("");
+                };
+
+                assert_eq!(packet.payload(), "The world is here".as_bytes().to_vec());
+            },
+            _ => panic!("No client response received")
+        };
+    }
+
+    async fn assert_initial_data_exchange(
+        client: &UdpSocket,
+        destination_addr: SocketAddrV4,
+        server: &mut IpOverUdpServer,
+        source_addr: SocketAddrV4,
+    ) -> (Arc<IpUdpStream>, u32) {
+        let (
+            stream,
+            client_seq_num,
+            server_seq_num,
+            server_timestamp
+        ) = assert_syn(&client, destination_addr, server, source_addr).await;
+
+        let ack_num = server_seq_num + 1;
+
+        assert_ack(
+            ack_num,
+            &client,
+            destination_addr,
+            client_seq_num,
+            server,
+            source_addr,
+            server_timestamp
+        ).await;
+
+        let seq_num = assert_data_request(
+            ack_num,
+            &client,
+            destination_addr,
+            "Hello world",
+            client_seq_num,
+            server,
+            source_addr,
+            stream.clone(),
+            server_timestamp,
+        ).await;
+
+        assert_data_response(
+            &client,
+            stream.clone(),
+        ).await;
+
+        (stream, seq_num)
+    }
 
     #[tokio::test]
     async fn test_syn() {
-        let mut rng = rand::rng();
-        let mut client_server = IpOverUdpServer::new("127.0.0.1:0").await.unwrap();
-        let destination_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-        let client_addr = client_server.socket.local_addr().unwrap();
+        let mut server = IpOverUdpServer::new("127.0.0.1:0").await.unwrap();
 
-        let destination_addr = Ipv4Addr::new(127, 0, 0, 1);
-        let destination_port = destination_server.local_addr().unwrap().port();
-        let seq_num = rng.next_u32();
-        let source_addr = Ipv4Addr::new(127, 0, 0, 1);
-        let source_port = client_server.socket.local_addr().unwrap().port();
+        let SocketAddr::V4(destination_addr) = destination.local_addr().unwrap() else {
+            panic!("Expected IPv4 address");
+        };
 
-        let packet = Ipv4TcpPacket::syn_packet(
+        let SocketAddr::V4(source_addr) = client.local_addr().unwrap() else {
+            panic!("Expected IPv4 address");
+        };
+
+        assert_initial_data_exchange(
+            &client,
             destination_addr,
-            destination_port,
-            seq_num,
+            &mut server,
             source_addr,
-            source_port,
-            65535
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn test_rst() {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let mut server = IpOverUdpServer::new("127.0.0.1:0").await.unwrap();
+
+        let SocketAddr::V4(destination_addr) = destination.local_addr().unwrap() else {
+            panic!("Expected IPv4 address");
+        };
+
+        let SocketAddr::V4(source_addr) = client.local_addr().unwrap() else {
+            panic!("Expected IPv4 address");
+        };
+
+        let (stream, seq_num) = assert_initial_data_exchange(
+            &client,
+            destination_addr,
+            &mut server,
+            source_addr,
+        ).await;
+
+        println!("+++ start +++");
+
+        let raw_rst_packet = get_rst_response(
+            *destination_addr.ip(),
+            destination_addr.port(),
+            seq_num,
+            *source_addr.ip(),
+            source_addr.port()
         ).unwrap();
 
-        let stream = client_server.handle_ipv4_tcp_packet(packet, client_addr).await;
+        client.send_to(raw_rst_packet.as_slice(), server.socket.local_addr().unwrap()).await.unwrap();
+
+        server.recv().await.unwrap();
+
+        let mut write_buffer = stream.write_buffer.lock().await;
+
+        *write_buffer = "The world is here".as_bytes().to_vec();
+
+        drop(write_buffer);
+
+        let mut buffer = [0u8; 1024];
+
+        match timeout(Duration::from_millis(1000), client.recv_from(&mut buffer)).await {
+            Ok(Ok((_, _))) => {
+                panic!("Client shouldn't receive any data.");
+            },
+            _ => println!("Clent doesn't receive any data because connection was closed")
+        };
+
+        assert!(false);
     }
 }

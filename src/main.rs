@@ -1,6 +1,9 @@
 mod handel_tcp;
 mod handle_udp;
 mod net_packet_parser;
+mod tcp_actor;
+mod tcp_state_machine;
+mod utils;
 
 use handle_udp::handle_upd;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
