@@ -6,8 +6,8 @@ mod tcp_state_machine;
 mod utils;
 
 use handle_udp::handle_upd;
+use std::error::Error;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use std::{error::Error};
 
 use crate::handel_tcp::handle_tcp;
 
@@ -17,9 +17,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    let console_layer = fmt::layer()
-        .with_writer(std::io::stdout)
-        .pretty();
+    let console_layer = fmt::layer().with_writer(std::io::stdout).pretty();
 
     let file_layer = fmt::layer()
         .with_writer(non_blocking)

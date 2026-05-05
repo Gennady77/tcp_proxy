@@ -1,19 +1,37 @@
-use tokio::{io::{AsyncRead, AsyncWrite, copy}, net::{TcpStream, UdpSocket}, sync::Mutex, time::sleep};
-use tracing::{debug, error, info, warn};
-use std::{cmp::min, collections::HashMap, error::Error, net::{SocketAddr, SocketAddrV4}, task::{Poll, Waker}, time::Duration};
 use rand::Rng;
 use std::sync::Arc;
+use std::{
+    cmp::min,
+    collections::HashMap,
+    error::Error,
+    net::{SocketAddr, SocketAddrV4},
+    task::{Poll, Waker},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, copy},
+    net::{TcpStream, UdpSocket},
+    sync::Mutex,
+    time::sleep,
+};
+use tracing::{debug, error, info, warn};
 
-use crate::{net_packet_parser::{IpTcpPacket, Ipv4TcpPacket, Packet, get_reset_response, net_packet_parser}, tcp_actor::{TcpActor, TcpActorEvent, TcpHandle}, utils::dump_raw_packet};
+use crate::{
+    net_packet_parser::{
+        IpTcpPacket, Ipv4TcpPacket, Packet, get_reset_response, net_packet_parser,
+    },
+    tcp_actor::{TcpActor, TcpActorEvent, TcpHandle},
+    utils::dump_raw_packet,
+};
 
 struct ReadHalf {
     buffer: Arc<Mutex<Vec<u8>>>,
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
-struct WriteHalf{
+struct WriteHalf {
     buffer: Arc<Mutex<Vec<u8>>>,
-    closed: Arc<Mutex<bool>>
+    closed: Arc<Mutex<bool>>,
 }
 
 struct IpUdpStream {
@@ -26,10 +44,7 @@ struct IpUdpStream {
 }
 
 impl IpUdpStream {
-    fn new(
-        destination_socket_addr: SocketAddr,
-        handle: TcpHandle,
-    ) -> Self {
+    fn new(destination_socket_addr: SocketAddr, handle: TcpHandle) -> Self {
         Self {
             closed: Arc::new(Mutex::new(false)),
             destination_socket_addr,
@@ -38,7 +53,6 @@ impl IpUdpStream {
             read_waker: Arc::new(Mutex::new(None)),
             write_buffer: Arc::new(Mutex::new(Vec::new())),
         }
-
     }
 
     fn split(&self) -> (ReadHalf, WriteHalf) {
@@ -53,7 +67,7 @@ impl IpUdpStream {
 
         let write_half = WriteHalf {
             buffer: write_buffer,
-            closed: self.closed.clone()
+            closed: self.closed.clone(),
         };
 
         (read_half, write_half)
@@ -77,7 +91,7 @@ impl AsyncWrite for WriteHalf {
 
         let closed = match this.closed.try_lock() {
             Ok(cls) => *cls,
-            Err(_) => return Poll::Pending
+            Err(_) => return Poll::Pending,
         };
 
         if closed {
@@ -91,12 +105,15 @@ impl AsyncWrite for WriteHalf {
                 wb.extend_from_slice(buf);
 
                 Poll::Ready(Ok(bytes_to_write))
-            },
-            Err(_) => Poll::Pending
+            }
+            Err(_) => Poll::Pending,
         }
     }
 
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let write_buffer = this.buffer.clone();
 
@@ -105,18 +122,19 @@ impl AsyncWrite for WriteHalf {
                 if wb.is_empty() {
                     Poll::Ready(Ok(()))
                 } else {
-                    Poll::Pending 
+                    Poll::Pending
                 }
-            },
-            Err(_) => Poll::Pending 
+            }
+            Err(_) => Poll::Pending,
         }
     }
 
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         match self.poll_flush(cx) {
-            Poll::Ready(Ok(())) => {
-                Poll::Ready(Ok(()))
-            }
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
@@ -158,7 +176,7 @@ impl AsyncRead for ReadHalf {
                 debug!("AsyncRead poll_read Poll::Ready(Ok(()))");
 
                 Poll::Ready(Ok(()))
-            },
+            }
             Err(_) => {
                 let mut waker = match waker_clone.try_lock() {
                     Ok(wk) => wk,
@@ -169,7 +187,7 @@ impl AsyncRead for ReadHalf {
 
                 *waker = Some(cx.waker().clone());
                 Poll::Pending
-            },
+            }
         }
     }
 }
@@ -194,7 +212,7 @@ impl IpOverUdpServer {
             match self.recv().await {
                 Ok(Some(stream)) => {
                     return Ok(stream);
-                },
+                }
                 Ok(None) => continue,
                 Err(_) => continue,
             }
@@ -215,16 +233,16 @@ impl IpOverUdpServer {
                 match self.handle_ip_packet(raw_ip_packet, socket_addr).await {
                     Ok(Some(stream)) => {
                         return Ok(Some(stream));
-                    },
+                    }
                     Ok(None) => {
                         return Ok(None);
-                    },
+                    }
                     Err(e) => {
                         error!("Handle ip packet error {e}");
                         return Err(e);
                     }
                 };
-            },
+            }
             Err(e) => {
                 error!("Recieve socket error: {}", e);
             }
@@ -233,28 +251,27 @@ impl IpOverUdpServer {
         Ok(None)
     }
 
-    async fn handle_ip_packet<'a>(
+    async fn handle_ip_packet(
         &mut self,
         raw_ip_packet: Vec<u8>,
-        socket_addr: SocketAddr
+        socket_addr: SocketAddr,
     ) -> Result<Option<Arc<IpUdpStream>>, Box<dyn Error>> {
         match net_packet_parser(&raw_ip_packet) {
             Some(Packet::Ipv6Tcp(ip_v6_tcp_packet)) => {
                 warn!("Received ipv6/tcp from udp {}", ip_v6_tcp_packet);
-            },
+            }
             Some(Packet::Ipv4Tcp(ip_tcp_packet)) => {
                 debug!("Received ipv4/tcp from udp {}", ip_tcp_packet);
 
-                let stream = self.handle_ipv4_tcp_packet(
-                    ip_tcp_packet,
-                    socket_addr,
-                ).await?;
+                let stream = self
+                    .handle_ipv4_tcp_packet(ip_tcp_packet, socket_addr)
+                    .await?;
 
                 return Ok(stream);
-            },
+            }
             None => {
                 warn!("Failed to parse packet");
-            },
+            }
             _ => {
                 warn!("Some unknown net/transport packet");
             }
@@ -280,12 +297,13 @@ impl IpOverUdpServer {
                 packet.tcp.destination_port,
             );
 
-            let stream = Arc::new(
-                IpUdpStream::new(
-                SocketAddr::V4(SocketAddrV4::new(packet.ip.destination_address, packet.tcp.destination_port)),
-                    handle,
-                )
-            );
+            let stream = Arc::new(IpUdpStream::new(
+                SocketAddr::V4(SocketAddrV4::new(
+                    packet.ip.destination_address,
+                    packet.tcp.destination_port,
+                )),
+                handle,
+            ));
 
             tokio::spawn(async move {
                 if let Err(e) = actor.run().await {
@@ -306,18 +324,17 @@ impl IpOverUdpServer {
                             let waker_clone = stream_cloned.read_waker.clone();
                             let mut waker = waker_clone.lock().await;
 
-
                             if let Some(waker) = waker.take() {
                                 waker.wake();
                             }
-                        },
+                        }
                         Some(TcpActorEvent::Close) => {
                             let mut closed_guard = stream_cloned.closed.lock().await;
 
                             *closed_guard = true;
 
                             break;
-                        },
+                        }
                         None => {
                             break;
                         }
@@ -347,7 +364,10 @@ impl IpOverUdpServer {
                 }
             });
 
-            let key = (packet.source_socket_addr(), packet.destination_socket_addr());
+            let key = (
+                packet.source_socket().to_string(),
+                packet.destination_socket().to_string(),
+            );
 
             self.conections.insert(key, stream.clone());
 
@@ -356,7 +376,10 @@ impl IpOverUdpServer {
             return Ok(Some(stream));
         }
 
-        let key = (packet.source_socket_addr(), packet.destination_socket_addr());
+        let key = (
+            packet.source_socket().to_string(),
+            packet.destination_socket().to_string(),
+        );
 
         let stream = match self.conections.get(&key) {
             Some(val) => val.clone(),
@@ -387,17 +410,17 @@ impl IpOverUdpServer {
 async fn send_response(
     response_raw: &Vec<u8>,
     socket: &UdpSocket,
-    addr: SocketAddr
+    addr: SocketAddr,
 ) -> Result<(), std::io::Error> {
     if let Err(e) = socket.send_to(response_raw.as_slice(), addr).await {
         error!("Failed to send answer to udp socket: {}", e);
 
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+        return Err(std::io::Error::other(e.to_string()));
     }
 
     dump_raw_packet(response_raw, "Sent");
 
-    return Ok(())
+    Ok(())
 }
 
 pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
@@ -417,8 +440,26 @@ pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
                     let (mut read_client, mut write_client) = client_stream.split();
 
                     tokio::select! {
-                        _ = copy(&mut read_client, &mut write_destination) => {}
-                        _ = copy(&mut read_destination, &mut write_client) => {}
+                        v = copy(&mut read_client, &mut write_destination) => {
+                            match v {
+                                Ok(n) => {
+                                    debug!("Translation from client to server is completed succeful {} bytes", n);
+                                }
+                                Err(e) => {
+                                    error!("Failed to trnslate from client to server: {}", e);
+                                }
+                            }
+                        }
+                        v = copy(&mut read_destination, &mut write_client) => {
+                            match v {
+                                Ok(n) => {
+                                    debug!("Translation from serber to client is completed succeful {} bytes", n);
+                                }
+                                Err(e) => {
+                                    error!("Failed to trnslate from server to client: {}", e);
+                                }
+                            }
+                        }
                     }
 
                     debug!("Stream/client pipe was closed ({})", addr);
@@ -435,13 +476,26 @@ pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::{Ipv4Addr, SocketAddr, SocketAddrV4}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+    use std::{
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use etherparse::{PacketBuilder, TcpOptionElement};
     use rand::Rng;
-    use tokio::{net::{TcpListener, UdpSocket}, time::timeout};
+    use tokio::{
+        net::{TcpListener, UdpSocket},
+        time::timeout,
+    };
 
-    use crate::{handle_udp::{IpOverUdpServer, IpUdpStream}, net_packet_parser::{IpTcpPacket, Packet, RawIpPacket, get_ack_data_response, get_ack_response, net_packet_parser}};
+    use crate::{
+        handle_udp::{IpOverUdpServer, IpUdpStream},
+        net_packet_parser::{
+            IpTcpPacket, Packet, RawIpPacket, get_ack_data_response, get_ack_response,
+            net_packet_parser,
+        },
+    };
 
     pub fn get_syn_response(
         destination_addr: &Ipv4Addr,
@@ -458,26 +512,16 @@ mod tests {
 
         let options = vec![
             TcpOptionElement::MaximumSegmentSize(1350),
-            TcpOptionElement::Timestamp(curr_timestamp, 0)
+            TcpOptionElement::Timestamp(curr_timestamp, 0),
         ];
 
-        let builder = PacketBuilder::
-            ipv4(
-                source_addr.octets(),
-                destination_addr.octets(),
-                64
-            )
-            .tcp(
-                source_port,
-                destination_port,
-                seq_num,
-                win_size,
-            )
+        let builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
+            .tcp(source_port, destination_port, seq_num, win_size)
             .syn();
 
-        let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+        let builder_with_options = builder
+            .options(options.as_slice())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         let payload = Vec::<u8>::new();
 
@@ -495,19 +539,8 @@ mod tests {
         source_addr: Ipv4Addr,
         source_port: u16,
     ) -> Result<RawIpPacket, std::io::Error> {
-
-        let builder = PacketBuilder::
-            ipv4(
-                source_addr.octets(),
-                destination_addr.octets(),
-                64
-            )
-            .tcp(
-                source_port,
-                destination_port,
-                seq_num,
-                0,
-            )
+        let builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
+            .tcp(source_port, destination_port, seq_num, 0)
             .rst();
 
         let payload = Vec::<u8>::new();
@@ -519,7 +552,6 @@ mod tests {
         Ok(buffer)
     }
 
-    
     async fn assert_syn(
         client: &UdpSocket,
         destination_addr: SocketAddrV4,
@@ -536,9 +568,13 @@ mod tests {
             source_addr.ip(),
             source_addr.port(),
             65535,
-        ).unwrap();
+        )
+        .unwrap();
 
-        client.send_to(syn_packet.as_slice(), server.socket.local_addr().unwrap()).await.unwrap();
+        client
+            .send_to(syn_packet.as_slice(), server.socket.local_addr().unwrap())
+            .await
+            .unwrap();
 
         client_seq_num = client_seq_num.saturating_add(1);
 
@@ -548,20 +584,21 @@ mod tests {
 
         let mut buffer = [0u8; 1024];
 
-        let ack_packet = match timeout(Duration::from_millis(500), client.recv_from(&mut buffer)).await {
-            Ok(Ok((n, _))) => {
-                let Some(Packet::Ipv4Tcp(packet)) = net_packet_parser(&buffer[..n]) else {
-                    panic!("");
-                };
+        let ack_packet =
+            match timeout(Duration::from_millis(500), client.recv_from(&mut buffer)).await {
+                Ok(Ok((n, _))) => {
+                    let Some(Packet::Ipv4Tcp(packet)) = net_packet_parser(&buffer[..n]) else {
+                        panic!("");
+                    };
 
-                assert!(packet.tcp.flags.syn);
-                assert!(packet.tcp.flags.ack);
-                assert_eq!(packet.tcp.acknowledgment_number, client_seq_num);
+                    assert!(packet.tcp.flags.syn);
+                    assert!(packet.tcp.flags.ack);
+                    assert_eq!(packet.tcp.acknowledgment_number, client_seq_num);
 
-                packet
-            },
-            _ => panic!("No client response received")
-        };
+                    packet
+                }
+                _ => panic!("No client response received"),
+            };
 
         let server_seq_number = ack_packet.tcp.sequence_number;
         let server_timestamp = ack_packet.options().timestamp.0;
@@ -587,9 +624,13 @@ mod tests {
             source_addr.port(),
             timestamp,
             65535,
-        ).unwrap();
+        )
+        .unwrap();
 
-        client.send_to(raw_packet.as_slice(), server.socket.local_addr().unwrap()).await.unwrap();
+        client
+            .send_to(raw_packet.as_slice(), server.socket.local_addr().unwrap())
+            .await
+            .unwrap();
 
         server.recv().await.unwrap();
     }
@@ -618,9 +659,16 @@ mod tests {
             source_addr.port(),
             timestamp,
             65535,
-        ).unwrap();
+        )
+        .unwrap();
 
-        client.send_to(raw_packet_data.as_slice(), server.socket.local_addr().unwrap()).await.unwrap();
+        client
+            .send_to(
+                raw_packet_data.as_slice(),
+                server.socket.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
 
         let nex_seq_num = seq_num.saturating_add(payload_data.len() as u32);
 
@@ -636,8 +684,8 @@ mod tests {
 
                 assert!(packet.tcp.flags.ack);
                 assert_eq!(packet.tcp.acknowledgment_number, nex_seq_num);
-            },
-            _ => panic!("No client response received")
+            }
+            _ => panic!("No client response received"),
         };
 
         let buffer = stream.read_buffer.lock().await;
@@ -649,10 +697,7 @@ mod tests {
         nex_seq_num
     }
 
-    async fn assert_data_response(
-        client: &UdpSocket,
-        stream: Arc<IpUdpStream>
-    ) {
+    async fn assert_data_response(client: &UdpSocket, stream: Arc<IpUdpStream>) {
         let mut write_buffer = stream.write_buffer.lock().await;
 
         *write_buffer = "The world is here".as_bytes().to_vec();
@@ -668,8 +713,8 @@ mod tests {
                 };
 
                 assert_eq!(packet.payload(), "The world is here".as_bytes().to_vec());
-            },
-            _ => panic!("No client response received")
+            }
+            _ => panic!("No client response received"),
         };
     }
 
@@ -679,12 +724,8 @@ mod tests {
         server: &mut IpOverUdpServer,
         source_addr: SocketAddrV4,
     ) -> (Arc<IpUdpStream>, u32) {
-        let (
-            stream,
-            client_seq_num,
-            server_seq_num,
-            server_timestamp
-        ) = assert_syn(&client, destination_addr, server, source_addr).await;
+        let (stream, client_seq_num, server_seq_num, server_timestamp) =
+            assert_syn(&client, destination_addr, server, source_addr).await;
 
         let ack_num = server_seq_num + 1;
 
@@ -695,8 +736,9 @@ mod tests {
             client_seq_num,
             server,
             source_addr,
-            server_timestamp
-        ).await;
+            server_timestamp,
+        )
+        .await;
 
         let seq_num = assert_data_request(
             ack_num,
@@ -708,12 +750,10 @@ mod tests {
             source_addr,
             stream.clone(),
             server_timestamp,
-        ).await;
+        )
+        .await;
 
-        assert_data_response(
-            &client,
-            stream.clone(),
-        ).await;
+        assert_data_response(&client, stream.clone()).await;
 
         (stream, seq_num)
     }
@@ -733,12 +773,7 @@ mod tests {
             panic!("Expected IPv4 address");
         };
 
-        assert_initial_data_exchange(
-            &client,
-            destination_addr,
-            &mut server,
-            source_addr,
-        ).await;
+        assert_initial_data_exchange(&client, destination_addr, &mut server, source_addr).await;
     }
 
     #[tokio::test]
@@ -756,24 +791,25 @@ mod tests {
             panic!("Expected IPv4 address");
         };
 
-        let (stream, seq_num) = assert_initial_data_exchange(
-            &client,
-            destination_addr,
-            &mut server,
-            source_addr,
-        ).await;
-
-        println!("+++ start +++");
+        let (stream, seq_num) =
+            assert_initial_data_exchange(&client, destination_addr, &mut server, source_addr).await;
 
         let raw_rst_packet = get_rst_response(
             *destination_addr.ip(),
             destination_addr.port(),
             seq_num,
             *source_addr.ip(),
-            source_addr.port()
-        ).unwrap();
+            source_addr.port(),
+        )
+        .unwrap();
 
-        client.send_to(raw_rst_packet.as_slice(), server.socket.local_addr().unwrap()).await.unwrap();
+        client
+            .send_to(
+                raw_rst_packet.as_slice(),
+                server.socket.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
 
         server.recv().await.unwrap();
 
@@ -788,10 +824,8 @@ mod tests {
         match timeout(Duration::from_millis(1000), client.recv_from(&mut buffer)).await {
             Ok(Ok((_, _))) => {
                 panic!("Client shouldn't receive any data.");
-            },
-            _ => println!("Clent doesn't receive any data because connection was closed")
+            }
+            _ => {}
         };
-
-        assert!(false);
     }
 }

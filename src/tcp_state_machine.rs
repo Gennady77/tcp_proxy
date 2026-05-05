@@ -1,10 +1,18 @@
 use rand::Rng;
+use std::{
+    collections::{BTreeMap, VecDeque, btree_map::Entry},
+    fmt::Display,
+    net::Ipv4Addr,
+};
 use tracing::{debug, error, warn};
-use std::{collections::{BTreeMap, VecDeque}, fmt::Display, net::{Ipv4Addr, SocketAddr}, sync::Arc};
 
-use tokio::net::UdpSocket;
-
-use crate::{net_packet_parser::{IpTcpPacket, Ipv4TcpPacket, TcpFlags, TcpPacket, get_ack_data_response, get_ack_response, get_handshake_response}, utils::send_response};
+use crate::{
+    net_packet_parser::{
+        IpTcpPacket, Ipv4TcpPacket, TcpFlags, TcpPacket, get_ack_data_response, get_ack_response,
+        get_handshake_response,
+    },
+    utils::PacketHandler,
+};
 
 #[derive(Clone, Copy)]
 pub enum TcpState {
@@ -38,7 +46,11 @@ impl Display for TcpEvent {
         match self {
             TcpEvent::DataArrives => write!(f, "DataArrives"),
             TcpEvent::RstArrives => write!(f, "RstArrives"),
-            TcpEvent::SegmentArrives(flags) => write!(f, "SegmentArrives(syn={}, psh={}, ack={}, fin={}, rst={})", flags.syn, flags.psh, flags.ack, flags.fin, flags.rst),
+            TcpEvent::SegmentArrives(flags) => write!(
+                f,
+                "SegmentArrives(syn={}, psh={}, ack={}, fin={}, rst={})",
+                flags.syn, flags.psh, flags.ack, flags.fin, flags.rst
+            ),
             TcpEvent::Unknown => write!(f, "Unknown"),
         }
     }
@@ -68,27 +80,25 @@ pub struct TcpStateMachine {
     pub read_buffer: Vec<u8>,
     snd_ack: u32,
     snd_seq: u32,
-    socket: Arc<UdpSocket>,
-    socket_addr: SocketAddr,
     source_addr: Ipv4Addr,
     source_port: u16,
     pub state: TcpState,
     wnd_scl: u8,
     wnd_size: u32,
+    handler: PacketHandler,
 }
 
 impl TcpStateMachine {
     pub fn new(
-        socket: Arc<UdpSocket>,
-        socket_addr: SocketAddr,
         source_addr: Ipv4Addr,
         source_port: u16,
         destination_addr: Ipv4Addr,
         destination_port: u16,
+        handler: PacketHandler,
     ) -> Self {
         let mut rng = rand::rng();
 
-        let sm = Self {
+        Self {
             app_buffer: VecDeque::new(),
             destination_addr,
             destination_port,
@@ -102,22 +112,19 @@ impl TcpStateMachine {
             read_buffer: Vec::new(),
             snd_ack: 0,
             snd_seq: rng.next_u32(),
-            socket,
-            socket_addr,
             source_addr,
             source_port,
             state: TcpState::Close,
             wnd_scl: 0,
             wnd_size: 0,
-        };
-
-        sm
+            handler,
+        }
     }
 
     async fn send_syn_ack_packet(&self) -> Result<(), std::io::Error> {
         let wnd_size = (self.wnd_size >> self.wnd_scl) as u16;
 
-        let syn_ack_packet = get_handshake_response(
+        let raw_response = get_handshake_response(
             self.snd_ack,
             self.source_addr,
             self.source_port,
@@ -130,12 +137,15 @@ impl TcpStateMachine {
             wnd_size,
         )?;
 
-        send_response(&syn_ack_packet, &self.socket, self.socket_addr).await?;
+        (self.handler)(raw_response).await?;
 
         Ok(())
     }
 
-    async fn handle_data_in_established(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+    async fn handle_data_in_established(
+        &mut self,
+        packet: Ipv4TcpPacket,
+    ) -> Result<(), std::io::Error> {
         let seq_num = packet.sequence_number();
         let data = packet.payload();
 
@@ -144,7 +154,12 @@ impl TcpStateMachine {
         } else if seq_num > self.rcv_seq_next {
             self.buffer_out_of_order_data(seq_num, data);
         } else {
-            warn!("Duplicate unordered segment from the past {} (seq_num={} < rcv_seq_next={})", packet.destination_socket_addr(), seq_num, self.rcv_seq_next);
+            warn!(
+                "Duplicate unordered segment from the past {} (seq_num={} < rcv_seq_next={})",
+                packet.destination_socket().to_string(),
+                seq_num,
+                self.rcv_seq_next
+            );
             self.send_ack().await?;
         }
 
@@ -155,7 +170,12 @@ impl TcpStateMachine {
         let data = packet.payload();
         let push_flag = packet.psh();
 
-        debug!("===process_in_order_data==== {} {} psh {}", packet.destination_socket_addr(), self.app_buffer.len(), push_flag);
+        debug!(
+            "===process_in_order_data==== {} {} psh {}",
+            packet.destination_socket().to_string(),
+            self.app_buffer.len(),
+            push_flag
+        );
 
         self.app_buffer.extend(data.as_slice());
 
@@ -175,17 +195,17 @@ impl TcpStateMachine {
         let wnd_size = (self.wnd_size >> self.wnd_scl) as u16;
 
         let raw_response = get_ack_response(
-            self.snd_ack, 
-            self.source_addr, 
+            self.snd_ack,
+            self.source_addr,
             self.source_port,
-            self.snd_seq, 
+            self.snd_seq,
             self.destination_addr,
             self.destination_port,
             self.rcv_timestamp,
             wnd_size,
         )?;
 
-        send_response(&raw_response, &self.socket, self.socket_addr).await?;
+        (self.handler)(raw_response).await?;
 
         Ok(())
     }
@@ -204,10 +224,13 @@ impl TcpStateMachine {
     }
 
     fn buffer_out_of_order_data(&mut self, seq_num: u32, data: Vec<u8>) {
-        if !self.out_of_order_buffer.contains_key(&seq_num) {
-            self.out_of_order_buffer.insert(seq_num, data);
-        } else {
-            warn!("Duplicate unordered segment SEQ={}", seq_num);
+        match self.out_of_order_buffer.entry(seq_num) {
+            Entry::Vacant(entry) => {
+                entry.insert(data);
+            }
+            Entry::Occupied(_) => {
+                warn!("Duplicate unordered segment SEQ={}", seq_num);
+            }
         }
     }
 
@@ -259,24 +282,26 @@ impl TcpStateMachine {
                 self.rcv_timestamp = packet.options().timestamp.0;
             }
             (_, TcpEvent::RstArrives) => {
-                warn!("process_event TcpEvent::RstArrives {} {}", packet.destination_socket_addr(), packet.sequence_number());
+                warn!(
+                    "process_event TcpEvent::RstArrives {} {}",
+                    packet.destination_socket().to_string(),
+                    packet.sequence_number()
+                );
 
                 self.read_buffer.clear();
                 self.app_buffer.clear();
 
-                println!("%%%%%%%%%%%%%%%");
-
                 self.state = TcpState::Close;
-            },
+            }
             (_, TcpEvent::Unknown) => {
                 warn!("++++++ process_event TcpEvent::Unknown");
             }
             _ => {
-                error!("Invalid state/event combination event {}, state {}", event, old_state);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Invalid state/event combination"
-                ));
+                error!(
+                    "Invalid state/event combination event {}, state {}",
+                    event, old_state
+                );
+                return Err(std::io::Error::other("Invalid state/event combination"));
             }
         };
 
@@ -284,14 +309,18 @@ impl TcpStateMachine {
     }
 
     pub async fn try_send_data(&mut self, mut data: Vec<u8>) {
-        debug!("TcpStateMachine try_send_data. data len {}, rcv_win {}", data.len(), self.rcv_wnd);
+        debug!(
+            "TcpStateMachine try_send_data. data len {}, rcv_win {}",
+            data.len(),
+            self.rcv_wnd
+        );
 
         while !data.is_empty() && self.rcv_wnd > 0 {
-            let send_size = (self.mss as u32)
-                .min(self.rcv_wnd)
-                .min(data.len() as u32) as usize;
+            let send_size = (self.mss as u32).min(self.rcv_wnd).min(data.len() as u32) as usize;
 
-            if send_size == 0 { break; }
+            if send_size == 0 {
+                break;
+            }
 
             let send_data: Vec<u8> = data.drain(0..send_size).collect();
 
@@ -308,9 +337,10 @@ impl TcpStateMachine {
                 self.destination_port,
                 self.rcv_timestamp,
                 65535,
-            ).unwrap();
+            )
+            .unwrap();
 
-            if let Err(e) = send_response(&raw_packet, &self.socket, self.socket_addr).await {
+            if let Err(e) = (self.handler)(raw_packet).await {
                 error!("Failed to send response {}", e);
                 continue;
             }

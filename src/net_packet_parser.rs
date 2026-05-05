@@ -1,7 +1,14 @@
 use core::fmt;
-use std::{fmt::Display, net::{Ipv4Addr, Ipv6Addr}, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    fmt::Display,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use etherparse::{IpNumber, NetSlice, PacketBuilder, SlicedPacket, TcpOptionElement, TransportSlice};
+use etherparse::{
+    IpNumber, NetSlice, PacketBuilder, SlicedPacket, TcpOptionElement, TransportSlice,
+};
+
 use tracing::{debug, error};
 
 pub type RawIpPacket = Vec<u8>;
@@ -38,6 +45,7 @@ pub struct Ipv4Packet {
 pub struct Ipv6Packet {
     pub source_addr: Ipv6Addr,
     pub destination_addr: Ipv6Addr,
+    pub flowinfo: u32,
 }
 
 pub struct ArpPacket {}
@@ -48,7 +56,7 @@ pub struct TcpFlags {
     pub psh: bool,
     pub ack: bool,
     pub fin: bool,
-    pub rst: bool
+    pub rst: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -61,7 +69,9 @@ pub struct TcpPacketOptions {
 
 impl Display for TcpPacketOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "mss {}, ws {}, sack {}, tstmp ({},{})",
+        write!(
+            f,
+            "mss {}, ws {}, sack {}, tstmp ({},{})",
             self.mss,
             self.window_scale,
             self.selective_ack_permitted,
@@ -72,7 +82,7 @@ impl Display for TcpPacketOptions {
 }
 
 #[derive(Clone)]
-pub struct TcpPacket{
+pub struct TcpPacket {
     pub source_port: u16,
     pub destination_port: u16,
     pub sequence_number: u32,
@@ -83,9 +93,11 @@ pub struct TcpPacket{
     pub flags: TcpFlags,
 }
 
-impl<'a> Display for TcpPacket {
+impl Display for TcpPacket {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "seqNum {}, ackNum {}, ack {}, psh {}, rst {}, syn {}, fin {}, wnd {}, payloadLen {}, options: [{}], payload {:?}",
+        write!(
+            f,
+            "seqNum {}, ackNum {}, ack {}, psh {}, rst {}, syn {}, fin {}, wnd {}, payloadLen {}, options: [{}], payload {:?}",
             self.sequence_number,
             self.acknowledgment_number,
             self.flags.ack,
@@ -108,8 +120,8 @@ pub struct Icmpv6Packet {}
 pub struct UdpPacket {}
 
 pub trait IpTcpPacket {
-    fn source_socket_addr(&self) -> String;
-    fn destination_socket_addr(&self) -> String;
+    fn source_socket(&self) -> SocketAddr;
+    fn destination_socket(&self) -> SocketAddr;
     fn sequence_number(&self) -> u32;
     fn source_port(&self) -> u16;
     fn destination_port(&self) -> u16;
@@ -132,11 +144,17 @@ pub struct Ipv4TcpPacket {
 }
 
 impl IpTcpPacket for Ipv4TcpPacket {
-    fn source_socket_addr(&self) -> String {
-        format!("{}:{}", self.ip.source_address, self.tcp.source_port)
+    fn source_socket(&self) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(
+            self.ip.source_address,
+            self.tcp.source_port,
+        ))
     }
-    fn destination_socket_addr(&self) -> String {
-        format!("{}:{}", self.ip.destination_address, self.tcp.destination_port)
+    fn destination_socket(&self) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(
+            self.ip.destination_address,
+            self.tcp.destination_port,
+        ))
     }
     fn sequence_number(&self) -> u32 {
         self.tcp.sequence_number
@@ -179,13 +197,15 @@ impl IpTcpPacket for Ipv4TcpPacket {
     }
 }
 
-impl<'a> Display for Ipv4TcpPacket {
+impl Display for Ipv4TcpPacket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}, {},  {} > {}, {}",
+        write!(
+            f,
+            "v{}, {},  {} > {}, {}",
             self.ip.version,
             self.ip.protocol.keyword_str().unwrap_or("unknown"),
-            self.source_socket_addr(),
-            self.destination_socket_addr(),
+            self.source_socket(),
+            self.destination_socket(),
             self.tcp
         )
     }
@@ -193,15 +213,25 @@ impl<'a> Display for Ipv4TcpPacket {
 
 pub struct Ipv6TcpPacket {
     pub ip: Ipv6Packet,
-    pub tcp: TcpPacket
+    pub tcp: TcpPacket,
 }
 
-impl<'a> IpTcpPacket for Ipv6TcpPacket {
-    fn destination_socket_addr(&self) -> String {
-        format!("[{}]:{}", self.ip.destination_addr, self.tcp.destination_port)
+impl IpTcpPacket for Ipv6TcpPacket {
+    fn source_socket(&self) -> SocketAddr {
+        SocketAddr::V6(SocketAddrV6::new(
+            self.ip.source_addr,
+            self.tcp.source_port,
+            self.ip.flowinfo,
+            0,
+        ))
     }
-    fn source_socket_addr(&self) -> String {
-        format!("[{}]:{}", self.ip.source_addr, self.tcp.source_port)
+    fn destination_socket(&self) -> SocketAddr {
+        SocketAddr::V6(SocketAddrV6::new(
+            self.ip.destination_addr,
+            self.tcp.destination_port,
+            self.ip.flowinfo,
+            0,
+        ))
     }
     fn sequence_number(&self) -> u32 {
         self.tcp.sequence_number
@@ -246,9 +276,11 @@ impl<'a> IpTcpPacket for Ipv6TcpPacket {
 
 impl Display for Ipv6TcpPacket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "source {}, dest {}, {}",
-            self.source_socket_addr(),
-            self.destination_socket_addr(),
+        write!(
+            f,
+            "source {}, dest {}, {}",
+            self.source_socket(),
+            self.destination_socket(),
             self.tcp
         )
     }
@@ -274,27 +306,17 @@ pub fn get_handshake_response(
     let options = vec![
         TcpOptionElement::MaximumSegmentSize(mss),
         TcpOptionElement::WindowScale(wnd_scl),
-        TcpOptionElement::Timestamp(curr_timestamp, timestamp)
+        TcpOptionElement::Timestamp(curr_timestamp, timestamp),
     ];
 
-    let builder = PacketBuilder::
-        ipv4(
-            source_addr.octets(),
-            destination_addr.octets(),
-            64
-        )
-        .tcp(
-            source_port,
-            destination_port,
-            seq_num,
-            win_size
-        )
+    let builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
+        .tcp(source_port, destination_port, seq_num, win_size)
         .syn()
         .ack(ack_num);
 
-    let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let builder_with_options = builder
+        .options(options.as_slice())
+        .map_err(std::io::Error::other)?;
 
     let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(0));
     let payload = Vec::<u8>::new();
@@ -319,27 +341,15 @@ pub fn get_ack_response(
         .unwrap_or_default()
         .as_millis() as u32;
 
-    let options = vec![
-        TcpOptionElement::Timestamp(curr_timestamp, timestamp)
-    ];
+    let options = vec![TcpOptionElement::Timestamp(curr_timestamp, timestamp)];
 
-    let builder = PacketBuilder::
-        ipv4(
-            source_addr.octets(),
-            destination_addr.octets(),
-            64
-        )
-        .tcp(
-            source_port,
-            destination_port,
-            seq_num,
-            win_size,
-        )
+    let builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
+        .tcp(source_port, destination_port, seq_num, win_size)
         .ack(ack_num);
 
-    let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let builder_with_options = builder
+        .options(options.as_slice())
+        .map_err(std::io::Error::other)?;
 
     let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(0));
     let payload = Vec::<u8>::new();
@@ -366,37 +376,25 @@ pub fn get_ack_data_response(
         .unwrap_or_default()
         .as_millis() as u32;
 
-    let options = vec![
-        TcpOptionElement::Timestamp(curr_timestamp, timestamp)
-    ];
+    let options = vec![TcpOptionElement::Timestamp(curr_timestamp, timestamp)];
 
-    let mut builder = PacketBuilder::
-        ipv4(
-            source_addr.octets(),
-            destination_addr.octets(),
-            64
-        )
-        .tcp(
-            source_port,
-            destination_port,
-            seq_num,
-            win_size,
-        )
+    let mut builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
+        .tcp(source_port, destination_port, seq_num, win_size)
         .ack(ack_num);
 
     if psh {
         builder = builder.psh();
     }
 
-    let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let builder_with_options = builder
+        .options(options.as_slice())
+        .map_err(std::io::Error::other)?;
 
     let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(payload.len()));
 
-    builder_with_options.write(&mut buffer, &payload).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    builder_with_options
+        .write(&mut buffer, &payload)
+        .map_err(std::io::Error::other)?;
 
     Ok(buffer)
 }
@@ -416,28 +414,16 @@ pub fn get_reset_response(
         .unwrap_or_default()
         .as_millis() as u32;
 
-    let options = vec![
-        TcpOptionElement::Timestamp(curr_timestamp, timestamp)
-    ];
+    let options = vec![TcpOptionElement::Timestamp(curr_timestamp, timestamp)];
 
-    let builder = PacketBuilder::
-        ipv4(
-            source_addr.octets(),
-            destination_addr.octets(),
-            64
-        )
-        .tcp(
-            source_port,
-            destination_port,
-            seq_num,
-            win_size,
-        )
+    let builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
+        .tcp(source_port, destination_port, seq_num, win_size)
         .rst()
         .ack(ack_num);
 
-    let builder_with_options = builder.options(options.as_slice()).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let builder_with_options = builder
+        .options(options.as_slice())
+        .map_err(std::io::Error::other)?;
 
     let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(0));
     let payload = Vec::<u8>::new();
@@ -448,23 +434,20 @@ pub fn get_reset_response(
 }
 
 pub fn net_packet_parser(raw_ip_packet: &[u8]) -> Option<Packet> {
-    match SlicedPacket::from_ip(&raw_ip_packet) {
+    match SlicedPacket::from_ip(raw_ip_packet) {
         Ok(sliced_packet) => {
             let net_packet: NetPacket = match &sliced_packet.net {
-                Some(NetSlice::Ipv4(ipv4_slice )) => {
-                    NetPacket::Ipv4(Ipv4Packet {
-                        version: ipv4_slice.header().version(),
-                        protocol: ipv4_slice.header().protocol(),
-                        source_address: ipv4_slice.header().source_addr(),
-                        destination_address: ipv4_slice.header().destination_addr()
-                    })
-                },
-                Some(NetSlice::Ipv6(ipv6_slice)) => {
-                    NetPacket::Ipv6(Ipv6Packet {
-                        source_addr: ipv6_slice.header().source_addr(),
-                        destination_addr: ipv6_slice.header().destination_addr(),
-                    })
-                },
+                Some(NetSlice::Ipv4(ipv4_slice)) => NetPacket::Ipv4(Ipv4Packet {
+                    version: ipv4_slice.header().version(),
+                    protocol: ipv4_slice.header().protocol(),
+                    source_address: ipv4_slice.header().source_addr(),
+                    destination_address: ipv4_slice.header().destination_addr(),
+                }),
+                Some(NetSlice::Ipv6(ipv6_slice)) => NetPacket::Ipv6(Ipv6Packet {
+                    source_addr: ipv6_slice.header().source_addr(),
+                    destination_addr: ipv6_slice.header().destination_addr(),
+                    flowinfo: ipv6_slice.header().flow_label().value(),
+                }),
                 Some(NetSlice::Arp(_arp_slice)) => NetPacket::Arp(ArpPacket {}),
                 None => NetPacket::Unknown,
             };
@@ -475,7 +458,7 @@ pub fn net_packet_parser(raw_ip_packet: &[u8]) -> Option<Packet> {
                         mss: 0,
                         window_scale: 0,
                         selective_ack_permitted: false,
-                        timestamp: (0,0)
+                        timestamp: (0, 0),
                     };
                     let tcp_options_iterator = tcp_slice.options_iterator();
 
@@ -484,19 +467,19 @@ pub fn net_packet_parser(raw_ip_packet: &[u8]) -> Option<Packet> {
                             Ok(option) => match option {
                                 TcpOptionElement::MaximumSegmentSize(mss) => {
                                     tcp_options.mss = mss;
-                                },
+                                }
                                 TcpOptionElement::WindowScale(scale) => {
                                     tcp_options.window_scale = scale;
-                                },
+                                }
                                 TcpOptionElement::SelectiveAcknowledgementPermitted => {
                                     tcp_options.selective_ack_permitted = true;
                                 }
                                 TcpOptionElement::Timestamp(ts, ts_echo) => {
                                     tcp_options.timestamp = (ts, ts_echo);
-                                },
-                                TcpOptionElement::Noop => {},
-                                _ => error!("Other option: {:?}", option)
-                            }
+                                }
+                                TcpOptionElement::Noop => {}
+                                _ => error!("Other option: {:?}", option),
+                            },
                             Err(e) => {
                                 error!("Error parsing option: {}", e);
                             }
@@ -519,44 +502,44 @@ pub fn net_packet_parser(raw_ip_packet: &[u8]) -> Option<Packet> {
                             fin: tcp_slice.fin(),
                         },
                     })
-                },
+                }
                 Some(TransportSlice::Icmpv4(_icmpv4_slice)) => {
                     TransportPacket::Icmpv4(Icmpv4Packet {})
-                },
+                }
                 Some(TransportSlice::Icmpv6(_icmpv6_slice)) => {
                     TransportPacket::Icmpv6(Icmpv6Packet {})
-                },
-                Some(TransportSlice::Udp(_udp_slice)) => {
-                    TransportPacket::Udp(UdpPacket {})
-                },
-                None => TransportPacket::Unknown
+                }
+                Some(TransportSlice::Udp(_udp_slice)) => TransportPacket::Udp(UdpPacket {}),
+                None => TransportPacket::Unknown,
             };
 
             let packet = match (net_packet, transport_packet) {
-                (NetPacket::Ipv4(ipv4_packet), TransportPacket::Tcp(tcp_packet)) => 
+                (NetPacket::Ipv4(ipv4_packet), TransportPacket::Tcp(tcp_packet)) => {
                     Packet::Ipv4Tcp(Ipv4TcpPacket {
                         ip: ipv4_packet,
                         tcp: tcp_packet,
-                    }),
+                    })
+                }
                 (NetPacket::Ipv4(_ipv4_packet), TransportPacket::Udp(_udp_packet)) => {
                     debug!("================ ipv4/udp packet");
 
                     Packet::Unknown
                 }
-                (NetPacket::Ipv6(ipv6_packet), TransportPacket::Tcp(tcp_packet)) => 
+                (NetPacket::Ipv6(ipv6_packet), TransportPacket::Tcp(tcp_packet)) => {
                     Packet::Ipv6Tcp(Ipv6TcpPacket {
                         ip: ipv6_packet,
-                        tcp: tcp_packet
-                    }),
+                        tcp: tcp_packet,
+                    })
+                }
                 _ => Packet::Unknown,
             };
 
-            return Some(packet);
+            Some(packet)
         }
         Err(e) => {
             error!("[net_packet_parser] failed to slice packet: {}", e);
 
-            return None;
-        },
+            None
+        }
     }
 }

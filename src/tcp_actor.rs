@@ -1,9 +1,19 @@
-use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
-use tokio::{net::UdpSocket, sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel}};
+use tokio::{
+    net::UdpSocket,
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
 use tracing::{debug, error};
 
-use crate::{net_packet_parser::{IpTcpPacket, Ipv4TcpPacket}, tcp_state_machine::{TcpState, TcpStateMachine}};
+use crate::{
+    net_packet_parser::{IpTcpPacket, Ipv4TcpPacket},
+    tcp_state_machine::{TcpState, TcpStateMachine},
+    utils::send_response,
+};
 
 pub enum TcpCommand {
     Packet(Ipv4TcpPacket),
@@ -22,7 +32,12 @@ pub struct TcpHandle {
 impl TcpHandle {
     pub fn send_packet(&self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
         if let Err(e) = self.cmd_tx.send(TcpCommand::Packet(packet.clone())) {
-            error!("Failed to send packet {}, {}: {}", packet.destination_socket_addr(), packet.sequence_number(), e);
+            error!(
+                "Failed to send packet {}, {}: {}",
+                packet.destination_socket().to_string(),
+                packet.sequence_number(),
+                e
+            );
         }
 
         Ok(())
@@ -36,7 +51,7 @@ impl TcpHandle {
 pub struct TcpActor {
     state: TcpStateMachine,
     cmd_rx: UnboundedReceiver<TcpCommand>,
-    read_tx: UnboundedSender<TcpActorEvent>
+    read_tx: UnboundedSender<TcpActorEvent>,
 }
 
 impl TcpActor {
@@ -52,12 +67,15 @@ impl TcpActor {
         let (read_tx, read_rx) = unbounded_channel();
 
         let mut state = TcpStateMachine::new(
-            socket,
-            socket_addr,
             source_addr,
             source_port,
             destination_addr,
             destination_port,
+            Box::new(move |packet| {
+                let socket_cloned = Arc::clone(&socket);
+
+                Box::pin(async move { send_response(packet, socket_cloned, socket_addr).await })
+            }),
         );
 
         state.state = TcpState::Listen;
@@ -68,7 +86,7 @@ impl TcpActor {
             read_tx,
         };
 
-        (TcpHandle { cmd_tx }, read_rx, actor )
+        (TcpHandle { cmd_tx }, read_rx, actor)
     }
 
     pub async fn run(&mut self) -> Result<(), std::io::Error> {
@@ -77,12 +95,9 @@ impl TcpActor {
                 TcpCommand::Packet(packet) => {
                     self.state.process_event(packet).await?;
 
-                    match self.state.state {
-                        TcpState::Close => {
-                            let _ = self.read_tx.send(TcpActorEvent::Close);
-                            break;
-                        },
-                        _ => {},
+                    if let TcpState::Close = self.state.state {
+                        let _ = self.read_tx.send(TcpActorEvent::Close);
+                        break;
                     }
 
                     if !self.state.read_buffer.is_empty() {
