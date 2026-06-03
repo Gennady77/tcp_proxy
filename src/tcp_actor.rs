@@ -7,7 +7,7 @@ use tokio::{
     net::UdpSocket,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::{
     net_packet_parser::{IpTcpPacket, Ipv4TcpPacket},
@@ -106,8 +106,6 @@ impl TcpActor {
                     }
                 }
                 TcpCommand::Write(data) => {
-                    debug!("TcpActor run TcpCommand::Write. data len {}", data.len());
-
                     self.state.try_send_data(data).await;
                 }
             }

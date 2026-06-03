@@ -652,7 +652,7 @@ mod tests {
             ack_num,
             *destination_addr.ip(),
             destination_addr.port(),
-            payload_data.clone(),
+            &payload_data,
             true,
             seq_num,
             *source_addr.ip(),

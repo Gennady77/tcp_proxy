@@ -363,7 +363,7 @@ pub fn get_ack_data_response(
     ack_num: u32,
     destination_addr: Ipv4Addr,
     destination_port: u16,
-    payload: Vec<u8>,
+    payload: &Vec<u8>,
     psh: bool,
     seq_num: u32,
     source_addr: Ipv4Addr,
@@ -393,7 +393,7 @@ pub fn get_ack_data_response(
     let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(payload.len()));
 
     builder_with_options
-        .write(&mut buffer, &payload)
+        .write(&mut buffer, payload)
         .map_err(std::io::Error::other)?;
 
     Ok(buffer)
