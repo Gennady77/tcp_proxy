@@ -463,11 +463,11 @@ impl TcpStateMachine {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::{Ipv4Addr, SocketAddrV4}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+    use std::{io::{Error, ErrorKind}, net::{Ipv4Addr, SocketAddrV4}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
     use etherparse::{PacketBuilder, TcpOptionElement};
     use rand::Rng;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, mpsc::{UnboundedReceiver, unbounded_channel}};
 
     use crate::{net_packet_parser::{IpTcpPacket, Ipv4TcpPacket, Packet, RawIpPacket, get_ack_data_response, get_ack_response, net_packet_parser}, tcp_state_machine::{TcpState, TcpStateMachine}};
 
@@ -593,7 +593,7 @@ mod tests {
     }
 
     struct Server {
-        response: Arc<Mutex<Vec<Ipv4TcpPacket>>>,
+        response_rx: UnboundedReceiver<Ipv4TcpPacket>,
         state: TcpStateMachine,
     }
 
@@ -602,8 +602,7 @@ mod tests {
             destination_socket: SocketAddrV4,
             source_socket: SocketAddrV4,
         ) -> Self {
-            let response = Arc::new(Mutex::new(Vec::new()));
-            let response_clone = response.clone();
+            let (tx, rx) = unbounded_channel::<Ipv4TcpPacket>();
 
             let mut state = TcpStateMachine::new(
                 *source_socket.ip(),
@@ -611,13 +610,11 @@ mod tests {
                 *destination_socket.ip(),
                 destination_socket.port(),
                 Box::new(move |raw_response| {
-                    let response_clone = response_clone.clone();
+                    let tx = tx.clone();
 
                     Box::pin(async move {
                         if let Some(Packet::Ipv4Tcp(syn_ack_packet)) = net_packet_parser(raw_response.as_slice()) {
-                            let mut raw_response_guard = response_clone.lock().await;
-
-                            raw_response_guard.push(syn_ack_packet);
+                            tx.send(syn_ack_packet).map_err(|e| Error::new(ErrorKind::Other, e))?;
 
                             Ok(())
                         } else {
@@ -630,7 +627,7 @@ mod tests {
             state.state = TcpState::Listen;
 
             let server = Server {
-                response,
+                response_rx: rx,
                 state,
             };
 
@@ -641,14 +638,15 @@ mod tests {
             self.state.process_event(packet.clone()).await.unwrap();
         }
         
-        async fn get_response(&self) -> Vec<Ipv4TcpPacket> {
-            let response_quard = self.response.lock().await;
-            response_quard.clone()
-        }
-        
-        async fn clear_response(&mut self) {
-            let mut response_quard = self.response.lock().await;
-            response_quard.clear();
+        async fn get_response(&mut self) -> Vec<Ipv4TcpPacket> {
+            let mut result: Vec<Ipv4TcpPacket> = Vec::new();
+
+
+            while let Ok(packet) = self.response_rx.try_recv() {
+                result.push(packet);
+            }
+
+            result
         }
 
         async fn send_data(&mut self, data: Vec<u8>) {
@@ -704,7 +702,7 @@ mod tests {
         for client_data_packet in net_client_server_packets {
             server.accept_request(client_data_packet.clone()).await;
             
-            let mut net_server_client_packets = server.response.lock().await;
+            let mut net_server_client_packets = server.get_response().await;
 
             let packet = net_server_client_packets.remove(0);
 
@@ -743,7 +741,7 @@ mod tests {
 
             server.accept_request(net_client_server_packet).await;
 
-            let mut net_server_client_packets = server.response.lock().await;
+            let mut net_server_client_packets = server.get_response().await;
         
             let packet = net_server_client_packets.remove(0);
 
@@ -775,9 +773,11 @@ mod tests {
 
         // Сервер отправляет пакеты с данными в сеть
         server.send_data(server_data.as_bytes().to_vec()).await;
+        let mut net_serever_client_packets: Vec<Ipv4TcpPacket> = Vec::new();
 
         let client_server_packet = {
-            let mut net_serever_client_packets = server.response.lock().await;
+            let mut resp = server.get_response().await;
+            net_serever_client_packets.append(&mut resp);
 
             // Проверка сколько пакетов в сети. По скольку ширина окна 3, то cwnd = 4
             assert_eq!(net_serever_client_packets.len(), 4);
@@ -789,27 +789,38 @@ mod tests {
         // сервер принимает ack на первый пакет
         server.accept_request(client_server_packet).await;
 
-        let net_serever_client_packets = server.response.lock().await;
+        let mut resp = server.get_response().await;
+        net_serever_client_packets.append(&mut resp);
         // Проверка сколько пакетов ы сети. cwnd увеличелось на 1. Теперь cwnd = 5
         assert_eq!(net_serever_client_packets.len(), 5);
-        drop(net_serever_client_packets);
 
-        let client_server_packet = {
-            let mut net_serever_client_packets = server.response.lock().await;
+        let mut resp = server.get_response().await;
+        net_serever_client_packets.append(&mut resp);
 
-            // Клиент принимает второй пакет из сети и генерит ack
-            client.accept_packet(net_serever_client_packets.remove(0).clone())
-        };
+        // Клиент принимает второй пакет из сети и генерит ack
+        let client_server_packet = client.accept_packet(net_serever_client_packets.remove(0).clone());
 
         // сервер принимает ack на второй пакет
         server.accept_request(client_server_packet.clone()).await;
 
-        let net_serever_client_packets = server.response.lock().await;
+        let mut resp = server.get_response().await;
+
+        // Сервер отдает пакеты в сеть
+        net_serever_client_packets.append(&mut resp);
         // Проверка сколько пакетов ы сети. cwnd увеличелось на 1. Теперь cwnd = 6
         assert_eq!(net_serever_client_packets.len(), 6);
-        drop(net_serever_client_packets);
 
         // Предположим, что третий пакет потерялся. Отправляем дублирующий ack от второго пакета
+        server.accept_request(client_server_packet.clone()).await;
+
+        let resp = server.get_response().await;
+        assert_eq!(resp.len(), 0);
+
+        // Проиходит второй дублирующий пакет
+        server.accept_request(client_server_packet.clone()).await;
+        assert_eq!(resp.len(), 0);
+
+        // Проиходит третий дублирующий пакет
         server.accept_request(client_server_packet.clone()).await;
 
     }
