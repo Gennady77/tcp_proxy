@@ -95,7 +95,7 @@ impl TcpActor {
                 TcpCommand::Packet(packet) => {
                     self.state.process_event(packet).await?;
 
-                    if let TcpState::Close = self.state.state {
+                    if let TcpState::Closed = self.state.state {
                         let _ = self.read_tx.send(TcpActorEvent::Close);
                         break;
                     }

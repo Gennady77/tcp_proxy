@@ -286,6 +286,44 @@ impl Display for Ipv6TcpPacket {
     }
 }
 
+pub fn get_syn_response(
+    destination_addr: Ipv4Addr,
+    destination_port: u16,
+    mss: u16,
+    seq_num: u32,
+    source_addr: Ipv4Addr,
+    source_port: u16,
+    wnd_scl: u8,
+    win_size: u16,
+) -> Result<RawIpPacket, std::io::Error> {
+    let curr_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32;
+
+    let options = vec![
+        TcpOptionElement::MaximumSegmentSize(mss),
+        TcpOptionElement::WindowScale(wnd_scl),
+        TcpOptionElement::Timestamp(curr_timestamp, 0),
+    ];
+
+    let builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
+        .tcp(source_port, destination_port, seq_num, win_size)
+        .syn();
+
+    let builder_with_options = builder
+        .options(options.as_slice())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    let payload = Vec::<u8>::new();
+
+    let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(payload.len()));
+
+    builder_with_options.write(&mut buffer, &payload).unwrap();
+
+    Ok(buffer)
+}
+
 pub fn get_handshake_response(
     ack_num: u32,
     destination_addr: Ipv4Addr,
