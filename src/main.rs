@@ -13,7 +13,7 @@ use crate::handel_tcp::handle_tcp;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let file_appender = tracing_appender::rolling::daily("./logs", "tcp_proxy.log");
+    let file_appender = tracing_appender::rolling::hourly("./logs", "tcp_proxy.log");
 
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 

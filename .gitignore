@@ -1,3 +1,4 @@
 /target
 /logs
 /.cargo
+.DS_Store
