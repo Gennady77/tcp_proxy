@@ -466,7 +466,7 @@ impl TcpStateMachine {
                 // Проверяем, это дублирующий ACK (new_ack == prev_rcv_ack)
                 if n == 0 && self.prev_rcv_ack != 0 {
                     self.dup_ack_count += 1;
-                    debug!("Duplicate ACK #{} received", self.dup_ack_count);
+                    debug!("Duplicate ACK #{} received {} > {}", self.dup_ack_count, packet.source_socket(), packet.destination_socket());
                     
                     // Fast Retransmit после 3 дублирующих ACK
                     if self.dup_ack_count == 3 && !self.fast_retransmit_done {
