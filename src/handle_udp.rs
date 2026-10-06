@@ -1,4 +1,5 @@
 use rand::Rng;
+use tokio::sync::mpsc::unbounded_channel;
 use std::sync::Arc;
 use std::{
     cmp::min,
@@ -16,6 +17,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
+use crate::tcp_state_machine::{TcpState, TcpStateMachine};
 use crate::{
     net_packet_parser::{
         IpTcpPacket, Ipv4TcpPacket, Packet, get_reset_response, net_packet_parser,
@@ -27,6 +29,7 @@ use crate::{
 struct ReadHalf {
     buffer: Arc<Mutex<Vec<u8>>>,
     waker: Arc<Mutex<Option<Waker>>>,
+    closed: Arc<Mutex<bool>>,
 }
 
 struct WriteHalf {
@@ -37,21 +40,21 @@ struct WriteHalf {
 struct IpUdpStream {
     closed: Arc<Mutex<bool>>,
     destination_socket_addr: SocketAddr,
-    handle: TcpHandle,
     read_buffer: Arc<Mutex<Vec<u8>>>,
     read_waker: Arc<Mutex<Option<Waker>>>,
     write_buffer: Arc<Mutex<Vec<u8>>>,
+    state: Arc<Mutex<TcpStateMachine>>
 }
 
 impl IpUdpStream {
-    fn new(destination_socket_addr: SocketAddr, handle: TcpHandle) -> Self {
+    fn new(destination_socket_addr: SocketAddr, state: Arc<Mutex<TcpStateMachine>>) -> Self {
         Self {
             closed: Arc::new(Mutex::new(false)),
             destination_socket_addr,
-            handle,
             read_buffer: Arc::new(Mutex::new(Vec::new())),
             read_waker: Arc::new(Mutex::new(None)),
             write_buffer: Arc::new(Mutex::new(Vec::new())),
+            state,
         }
     }
 
@@ -63,6 +66,7 @@ impl IpUdpStream {
         let read_half = ReadHalf {
             buffer: read_buffer,
             waker: read_waker,
+            closed: self.closed.clone(),
         };
 
         let write_half = WriteHalf {
@@ -77,6 +81,12 @@ impl IpUdpStream {
         let closed_guard = self.closed.lock().await;
 
         *closed_guard
+    }
+
+    pub async fn close(&self) {
+        let state = self.state.lock().await;
+
+        state.close();
     }
 }
 
@@ -149,6 +159,7 @@ impl AsyncRead for ReadHalf {
     ) -> Poll<std::io::Result<()>> {
         let read_buffer = self.buffer.clone();
         let waker_clone = self.waker.clone();
+        let closed = self.closed.clone();
 
         match read_buffer.try_lock() {
             Ok(mut rb) => {
@@ -159,7 +170,18 @@ impl AsyncRead for ReadHalf {
                     }
                 };
 
+                // Если буфер пуст и соединение закрыто — это EOF
                 if rb.is_empty() {
+                    let is_closed = match closed.try_lock() {
+                        Ok(c) => *c,
+                        Err(_) => false,
+                    };
+
+                    if is_closed {
+                        debug!("AsyncRead poll_read EOF");
+                        return Poll::Ready(Ok(()));
+                    }
+
                     *waker = Some(cx.waker().clone());
                     return Poll::Pending;
                 }
@@ -261,7 +283,7 @@ impl IpOverUdpServer {
                 warn!("Received ipv6/tcp from udp {}", ip_v6_tcp_packet);
             }
             Some(Packet::Ipv4Tcp(ip_tcp_packet)) => {
-                debug!("Received ipv4/tcp from udp {}", ip_tcp_packet);
+                debug!("{}", ip_tcp_packet);
 
                 let stream = self
                     .handle_ipv4_tcp_packet(ip_tcp_packet, socket_addr)
@@ -288,35 +310,56 @@ impl IpOverUdpServer {
         if packet.syn() && !packet.ack() {
             let socket = Arc::clone(&self.socket);
 
-            let (handle, mut read_rx, mut actor) = TcpActor::new(
-                socket,
-                socket_addr,
+            let (read_tx, mut read_rx) = unbounded_channel::<Vec<u8>>();
+
+            // let (handle, mut read_rx, mut actor) = TcpActor::new(
+            //     socket,
+            //     socket_addr,
+            //     packet.ip.source_address,
+            //     packet.tcp.source_port,
+            //     packet.ip.destination_address,
+            //     packet.tcp.destination_port,
+            // );
+
+            let mut state = TcpStateMachine::new(
                 packet.ip.source_address,
                 packet.tcp.source_port,
                 packet.ip.destination_address,
                 packet.tcp.destination_port,
+                read_tx,
+                Box::new(move |resp_packet| {
+                    let socket_cloned = Arc::clone(&socket);
+
+                    Box::pin(async move { send_response(&resp_packet, &socket_cloned, socket_addr).await })
+                }),
             );
+
+            state.state = TcpState::Listen;
+
+            let state = Arc::new(Mutex::new(state));
+            let state_cloned = state.clone();
 
             let stream = Arc::new(IpUdpStream::new(
                 SocketAddr::V4(SocketAddrV4::new(
                     packet.ip.destination_address,
                     packet.tcp.destination_port,
                 )),
-                handle,
+                state_cloned,
             ));
 
-            tokio::spawn(async move {
-                if let Err(e) = actor.run().await {
-                    error!("Failed to raun actor {}", e);
-                }
-            });
+            // tokio::spawn(async move {
+            //     if let Err(e) = actor.run().await {
+            //         error!("Failed to raun actor {}", e);
+            //     }
+            // });
 
             let stream_cloned = stream.clone();
+            let state_cloned = state.clone();
 
             tokio::spawn(async move {
                 loop {
                     match read_rx.recv().await {
-                        Some(TcpActorEvent::Data(mut data)) => {
+                        Some(mut data) => {
                             let mut rb = stream_cloned.read_buffer.lock().await;
 
                             rb.append(&mut data);
@@ -328,19 +371,51 @@ impl IpOverUdpServer {
                                 waker.wake();
                             }
                         }
-                        Some(TcpActorEvent::Close) => {
-                            let mut closed_guard = stream_cloned.closed.lock().await;
-
-                            *closed_guard = true;
-
-                            break;
-                        }
                         None => {
+                            // Канал закрыт — это EOF, сигнализируем ReadHalf
+                            let mut closed_guard = stream_cloned.closed.lock().await;
+                            *closed_guard = true;
+                            // Пробуждаем ожидающий read
+                            let waker_clone = stream_cloned.read_waker.clone();
+                            if let Ok(mut waker) = waker_clone.try_lock() {
+                                if let Some(waker) = waker.take() {
+                                    waker.wake();
+                                }
+                            }
                             break;
                         }
                     }
                 }
             });
+
+            // tokio::spawn(async move {
+            //     loop {
+            //         match read_rx.recv().await {
+            //             Some(TcpActorEvent::Data(mut data)) => {
+            //                 let mut rb = stream_cloned.read_buffer.lock().await;
+
+            //                 rb.append(&mut data);
+
+            //                 let waker_clone = stream_cloned.read_waker.clone();
+            //                 let mut waker = waker_clone.lock().await;
+
+            //                 if let Some(waker) = waker.take() {
+            //                     waker.wake();
+            //                 }
+            //             }
+            //             Some(TcpActorEvent::Close) => {
+            //                 let mut closed_guard = stream_cloned.closed.lock().await;
+
+            //                 *closed_guard = true;
+
+            //                 break;
+            //             }
+            //             None => {
+            //                 break;
+            //             }
+            //         }
+            //     }
+            // });
 
             let stream_cloned = stream.clone();
 
@@ -354,11 +429,14 @@ impl IpOverUdpServer {
 
                     if !wb.is_empty() {
                         let write_len = wb.len();
-                        let data = wb.drain(..write_len).collect();
-                        stream_cloned.handle.write(data);
-                    }
+                        let data: Vec<u8> = wb.drain(..write_len).collect();
+                        drop(wb);
 
-                    drop(wb);
+                        let mut state = state_cloned.lock().await;
+                        state.try_send_data(data).await;
+                    } else {
+                        drop(wb);
+                    }
 
                     sleep(Duration::from_millis(10)).await;
                 }
@@ -371,7 +449,10 @@ impl IpOverUdpServer {
 
             self.conections.insert(key, stream.clone());
 
-            stream.handle.send_packet(packet.clone())?;
+            let mut state_guard = state.lock().await;
+            state_guard.process_event(packet).await?;
+
+            // stream.handle.send_packet(packet.clone())?;
 
             return Ok(Some(stream));
         }
@@ -401,7 +482,9 @@ impl IpOverUdpServer {
             }
         };
 
-        stream.handle.send_packet(packet.clone())?;
+        let mut state_guard = stream.state.lock().await;
+
+        state_guard.process_event(packet.clone()).await?;
 
         Ok(None)
     }
@@ -461,6 +544,8 @@ pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
+
+                    client_stream.close();
 
                     debug!("Stream/client pipe was closed ({})", addr);
                 }

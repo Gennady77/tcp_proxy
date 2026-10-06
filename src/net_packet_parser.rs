@@ -95,20 +95,32 @@ pub struct TcpPacket {
 
 impl Display for TcpPacket {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut flags = "";
+
+        if self.flags.syn && !self.flags.ack {
+            flags = "S";
+        } else if self.flags.syn && self.flags.ack {
+            flags = "S.";
+        } else if !self.flags.syn && self.flags.ack {
+            flags = ".";
+        } else if self.flags.ack && self.flags.psh {
+            flags = "P.";
+        } else if self.flags.ack && self.flags.fin && !self.flags.psh {
+            flags = "F.";
+        } else if self.flags.ack && self.flags.fin && self.flags.psh {
+            flags = "F.";
+        } else if self.flags.rst {
+            flags = "R";
+        }
+
         write!(
             f,
-            "seqNum {}, ackNum {}, ack {}, psh {}, rst {}, syn {}, fin {}, wnd {}, payloadLen {}, options: [{}], payload {:?}",
+            "[{}], seq {}, ack {}, win {}, length {}",
+            flags,
             self.sequence_number,
             self.acknowledgment_number,
-            self.flags.ack,
-            self.flags.psh,
-            self.flags.rst,
-            self.flags.syn,
-            self.flags.fin,
             self.window_size,
             self.payload.len(),
-            self.options,
-            self.payload.get(..7).unwrap_or(&[])
         )
     }
 }
@@ -201,9 +213,7 @@ impl Display for Ipv4TcpPacket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "v{}, {},  {} > {}, {}",
-            self.ip.version,
-            self.ip.protocol.keyword_str().unwrap_or("unknown"),
+            "IP {} > {}: {}",
             self.source_socket(),
             self.destination_socket(),
             self.tcp
@@ -457,6 +467,40 @@ pub fn get_reset_response(
     let builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
         .tcp(source_port, destination_port, seq_num, win_size)
         .rst()
+        .ack(ack_num);
+
+    let builder_with_options = builder
+        .options(options.as_slice())
+        .map_err(std::io::Error::other)?;
+
+    let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(0));
+    let payload = Vec::<u8>::new();
+
+    builder_with_options.write(&mut buffer, &payload).unwrap();
+
+    Ok(buffer)
+}
+
+pub fn get_fin_response(
+    ack_num: u32,
+    destination_addr: Ipv4Addr,
+    destination_port: u16,
+    seq_num: u32,
+    source_addr: Ipv4Addr,
+    source_port: u16,
+    timestamp: u32,
+    win_size: u16,
+) -> Result<RawIpPacket, std::io::Error> {
+    let curr_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32;
+
+    let options = vec![TcpOptionElement::Timestamp(curr_timestamp, timestamp)];
+
+    let builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
+        .tcp(source_port, destination_port, seq_num, win_size)
+        .fin()
         .ack(ack_num);
 
     let builder_with_options = builder

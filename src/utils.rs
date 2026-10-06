@@ -14,7 +14,7 @@ pub type PacketHandler = Box<
 pub fn dump_raw_packet(raw_packet: &RawIpPacket, prefix: &str) {
     match net_packet_parser(raw_packet) {
         Some(Packet::Ipv4Tcp(parsed_response)) => {
-            debug!("{} Ipv4Tcp packet {}", prefix, parsed_response);
+            debug!("{}", parsed_response);
         }
         Some(Packet::Ipv6Tcp(parsed_response)) => {
             debug!("{} Ipv6Tcp packet {}", prefix, parsed_response);

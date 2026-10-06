@@ -1,23 +1,26 @@
 use rand::Rng;
+use tokio::{sync::{Mutex, mpsc::UnboundedSender}};
 use std::{
-    collections::{BTreeMap, VecDeque, btree_map::Entry}, fmt::Display, io, net::Ipv4Addr, time::{Duration, Instant}, u32
+    collections::{BTreeMap, btree_map::Entry}, fmt::Display, net::Ipv4Addr, sync::Arc, time::Instant, u32
 };
 use tracing::{debug, error, warn};
 
 use crate::{
     net_packet_parser::{
-        IpTcpPacket, Ipv4TcpPacket, TcpFlags, TcpPacket, get_ack_data_response, get_ack_response,
-        get_handshake_response, get_syn_response,
+        IpTcpPacket, Ipv4TcpPacket, RawIpPacket, TcpFlags, TcpPacket, get_ack_data_response, get_ack_response, get_fin_response, get_handshake_response, get_syn_response
     }, utils::PacketHandler
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TcpState {
     Closed,
     Listen,
     SynSent,
     SynReceived,
     Established,
+    FinWait1,
+    FinWait2,
+    CloseWait,
 }
 
 impl Display for TcpState {
@@ -28,6 +31,9 @@ impl Display for TcpState {
             TcpState::SynSent => write!(f, "SynSent"),
             TcpState::SynReceived => write!(f, "SynReceived"),
             TcpState::Established => write!(f, "Established"),
+            TcpState::FinWait1 => write!(f, "FIN-WAIT-1"),
+            TcpState::FinWait2 => write!(f, "FIN-WAIT-2"),
+            TcpState::CloseWait => write!(f, "CLOSE-WAIT"),
         }
     }
 }
@@ -55,6 +61,8 @@ impl Display for TcpEvent {
     }
 }
 
+/// ВАЖНО: наличие payload имеет приоритет над флагами — сегмент с данными и FIN
+/// трактуется как DataArrives, а не как SegmentArrives(fin).
 fn packet_to_event(packet: TcpPacket) -> TcpEvent {
     match packet {
         p if !p.payload.is_empty() => TcpEvent::DataArrives,
@@ -74,36 +82,45 @@ struct PendingPacket {
 }
 
 pub struct TcpStateMachine {
-    app_buffer: Vec<u8>,
+    // --- Конфигурация соединения ---
     destination_addr: Ipv4Addr,
     destination_port: u16,
-    mss: u16,
-    out_of_order_buffer: BTreeMap<u32, Ipv4TcpPacket>,
-    prev_rcv_ack: u32,
-    pub read_buffer: Vec<u8>,
-    rcv_ack: u32,
-    rcv_seq: u32,
-    rcv_seq_next: u32,
-    handler: PacketHandler,
-    send_buffer: Vec<u8>,
     source_addr: Ipv4Addr,
     source_port: u16,
-    ssthresh: u32,
-    pub state: TcpState,
+    handler: PacketHandler,
+    mss: u16,
+    smss: u16,
     wnd_scl: u8,
-    // wnd_size: u32,
-    cwnd: u32,
-    dup_ack_count: u32,
-    fast_retransmit_done: bool,
-    flight_size: u32,
+    snd_wnd_scl: u8,
+
+    // --- Состояние FSM ---
+    pub state: TcpState,
+    prev_rcv_ack: u32,
+
+    // --- Приём (receive path) ---
+    rcv_seq: u32,
+    rcv_seq_next: u32,
+    rcv_ack: u32,
     rcv_timestamp: u32,
     rwnd: u32,
-    smss: u16,
-    snd_ack: u32,
-    snd_seq: u32,
-    snd_wnd_scl: u8,
     snd_wnd_size: u32,
+    app_buffer: Vec<u8>,
+    out_of_order_buffer: BTreeMap<u32, Ipv4TcpPacket>,
+    pub read_buffer: Vec<u8>,
+    read_buffer_tx: Option<UnboundedSender<Vec<u8>>>,
+
+    // --- Передача (send path) ---
+    snd_seq: u32,
+    snd_ack: u32,
+    pub send_buffer: Arc<Mutex<Vec<u8>>>,
     unacked_packets: BTreeMap<u32, PendingPacket>,
+
+    // --- Управление перегрузкой (RFC 5681) ---
+    cwnd: u32,
+    ssthresh: u32,
+    flight_size: u32,
+    dup_ack_count: u32,
+    fast_retransmit_done: bool,
 }
 
 impl TcpStateMachine {
@@ -112,46 +129,61 @@ impl TcpStateMachine {
         source_port: u16,
         destination_addr: Ipv4Addr,
         destination_port: u16,
+        read_buffer_tx: UnboundedSender<Vec<u8>>,
         handler: PacketHandler,
     ) -> Self {
         let mut rng = rand::rng();
 
         Self {
-            app_buffer: Vec::new(),
+            // --- Конфигурация соединения ---
             destination_addr,
             destination_port,
-            mss: 65535,
-            out_of_order_buffer: BTreeMap::new(),
-            prev_rcv_ack: 0,
-            read_buffer: Vec::new(),
-            rcv_ack: 0,
-            rcv_seq: 0,
-            rcv_seq_next: 0,
-            handler,
-            send_buffer: Vec::new(),
             source_addr,
             source_port,
-            ssthresh: u32::MAX,
-            state: TcpState::Closed,
+            handler,
+            mss: 65535,
+            smss: 65535,
             wnd_scl: 0,
-            // wnd_size: 0,
-            cwnd: 0,
-            dup_ack_count: 0,
-            fast_retransmit_done: false,
-            flight_size: 0,
+            snd_wnd_scl: 10,
+
+            // --- Состояние FSM ---
+            state: TcpState::Closed,
+            prev_rcv_ack: 0,
+
+            // --- Приём (receive path) ---
+            rcv_seq: 0,
+            rcv_seq_next: 0,
+            rcv_ack: 0,
             rcv_timestamp: 0,
             rwnd: 0,
-            smss: 65535,
-            snd_ack: 0,
-            snd_seq: rng.next_u32(),
-            snd_wnd_scl: 10,
             snd_wnd_size: 65535 << 10,
+            app_buffer: Vec::new(),
+            out_of_order_buffer: BTreeMap::new(),
+            read_buffer: Vec::new(),
+            read_buffer_tx: Some(read_buffer_tx),
+
+            // --- Передача (send path) ---
+            snd_seq: rng.next_u32(),
+            snd_ack: 0,
+            send_buffer: Arc::new(Mutex::new(Vec::new())),
             unacked_packets: BTreeMap::new(),
+
+            // --- Управление перегрузкой (RFC 5681) ---
+            cwnd: 0,
+            ssthresh: u32::MAX,
+            flight_size: 0,
+            dup_ack_count: 0,
+            fast_retransmit_done: false,
         }
     }
 
+    /// Размер окна, анонсируемый в исходящих пакетах (учитывает window scale)
+    fn advertised_window(&self) -> u16 {
+        (self.snd_wnd_size >> self.snd_wnd_scl) as u16
+    }
+
     async fn send_syn_ack_packet(&self) -> Result<(), std::io::Error> {
-        let wnd_size = (self.snd_wnd_size >> self.snd_wnd_scl) as u16;
+        let wnd_size = self.advertised_window();
 
         let raw_response = get_handshake_response(
             self.snd_ack,
@@ -171,66 +203,31 @@ impl TcpStateMachine {
         Ok(())
     }
 
-    async fn handle_data_in_established(
-        &mut self,
-        packet: Ipv4TcpPacket,
-    ) -> Result<(), std::io::Error> {
-        let seq_num = packet.sequence_number();
-
-        if seq_num == self.rcv_seq_next {
-            self.process_in_order_data(packet).await?;
-        } else if seq_num > self.rcv_seq_next {
-            self.buffer_out_of_order_data(seq_num, packet);
-        } else {
-            warn!(
-                "Duplicate unordered segment from the past {} (seq_num={} < rcv_seq_next={})",
-                packet.destination_socket().to_string(),
-                seq_num,
-                self.rcv_seq_next
-            );
-            self.send_ack().await?;
-        }
-
-        Ok(())
-    }
-
-    async fn process_data(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+    fn process_data(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
         let data = packet.payload();
         let push_flag = packet.psh();
 
         self.app_buffer.extend(data.as_slice());
 
         if push_flag {
-            let data_buff: Vec<u8> = self.app_buffer.drain(..self.app_buffer.len()).collect();
+            let data_buff = std::mem::take(&mut self.app_buffer);
 
-            self.read_buffer.extend(data_buff);
+            if let Some(tx) = self.read_buffer_tx.as_ref() {
+                tx.send(data_buff).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
         }
         Ok(())
     }
 
-    async fn process_in_order_data(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
-        let data = packet.payload();
-        let push_flag = packet.psh();
+    /// Обрабатывает сегмент, пришедший в порядке очереди: обновляет rcv-состояние
+    /// и передаёт данные из сегмента в app_buffer (process_data).
+    fn accept_in_order_segment(&mut self, packet: &Ipv4TcpPacket) -> Result<(), std::io::Error> {
+        self.rcv_seq = packet.sequence_number();
+        self.rwnd = (packet.window_size() as u32) << self.wnd_scl;
+        self.rcv_seq_next = self.rcv_seq.wrapping_add(packet.payload().len() as u32);
+        self.snd_ack = self.rcv_seq.wrapping_add(packet.payload().len() as u32);
 
-        debug!(
-            "===process_in_order_data==== {} {} psh {}",
-            packet.destination_socket().to_string(),
-            self.app_buffer.len(),
-            push_flag
-        );
-
-        self.app_buffer.extend(data.as_slice());
-
-        self.drain_out_of_order_buffer();
-
-        self.send_ack().await?;
-
-        if push_flag {
-            let data_buff: Vec<u8> = self.app_buffer.drain(..self.app_buffer.len()).collect();
-
-            self.read_buffer.extend(data_buff);
-        }
-        Ok(())
+        self.process_data(packet.clone())
     }
 
     async fn send_syn(&mut self, mss: Option<u16>) -> Result<(), std::io::Error> {
@@ -247,7 +244,7 @@ impl TcpStateMachine {
             self.source_addr,
             self.source_port,
             self.snd_wnd_scl,
-            (self.snd_wnd_size >> self.snd_wnd_scl) as u16,
+            self.advertised_window(),
         )?;
 
         (self.handler)(raw_packet).await?;
@@ -258,7 +255,7 @@ impl TcpStateMachine {
     }
 
     async fn send_ack(&self) -> Result<(), std::io::Error> {
-        let wnd_size = (self.snd_wnd_size >> self.snd_wnd_scl) as u16;
+        let wnd_size = self.advertised_window();
 
         let raw_response = get_ack_response(
             self.snd_ack,
@@ -276,17 +273,15 @@ impl TcpStateMachine {
         Ok(())
     }
 
-    fn drain_out_of_order_buffer(&mut self) {
-        let mut next_seq = self.rcv_seq;
-
-        while let Some(data) = self.out_of_order_buffer.remove(&next_seq) {
-            self.app_buffer.extend(data.payload().as_slice());
-            next_seq = next_seq.wrapping_add(data.payload().len() as u32);
+    /// Отправляет сырой пакет через handler: логирует ошибку и возвращает её
+    /// вызывающему, который решает — пробросить или игнорировать.
+    async fn send_raw(&self, raw_packet: RawIpPacket, context: &str) -> Result<(), std::io::Error> {
+        if let Err(e) = (self.handler)(raw_packet).await {
+            error!("Failed to send {} response {}", context, e);
+            return Err(e);
         }
 
-        if next_seq != self.rcv_seq {
-            self.rcv_seq = next_seq;
-        }
+        Ok(())
     }
 
     fn buffer_out_of_order_data(&mut self, seq_num: u32, data: Ipv4TcpPacket) {
@@ -297,6 +292,16 @@ impl TcpStateMachine {
             Entry::Occupied(_) => {
                 warn!("Duplicate unordered segment SEQ={}", seq_num);
             }
+        }
+    }
+
+    /// Обновляет prev_rcv_ack для отслеживания дублирующих ACK.
+    /// Вызывается ДО присвоения self.rcv_ack нового значения.
+    fn update_prev_rcv_ack(&mut self, new_ack: u32) {
+        if self.prev_rcv_ack == 0 {
+            self.prev_rcv_ack = new_ack;
+        } else {
+            self.prev_rcv_ack = self.rcv_ack;
         }
     }
 
@@ -353,6 +358,8 @@ impl TcpStateMachine {
         self.recalc_flight_size();
     }
 
+    /// Диспетчер FSM: определяет событие из пакета и передаёт обработку
+    /// хендлеру, соответствующему паре (состояние, событие).
     pub async fn process_event(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
         let old_state = self.state;
 
@@ -360,200 +367,310 @@ impl TcpStateMachine {
 
         match (old_state, event.clone()) {
             (TcpState::Listen, TcpEvent::SegmentArrives(flags)) if flags.syn && !flags.ack => {
-                self.mss = packet.options().mss.min(self.mss);
-                self.wnd_scl = packet.options().window_scale;
-                self.rcv_seq = packet.sequence_number();
-                self.rcv_ack = packet.acknowledgment_number();
-
-                self.smss = packet.options().mss;
-                self.init_cwnd();
-
-                self.rcv_timestamp = packet.options().timestamp.0;
-                self.snd_ack = self.rcv_seq.wrapping_add(1);
-                self.rwnd = (packet.window_size() as u32) << self.wnd_scl;
-
-                self.send_syn_ack_packet().await?;
-
-                self.rcv_seq_next = self.rcv_seq.wrapping_add(1);
-                self.snd_seq = self.snd_seq.wrapping_add(1);
-
-                self.state = TcpState::SynReceived;
+                self.handle_syn_in_listen(packet).await
             }
             (TcpState::SynSent, TcpEvent::SegmentArrives(flags)) if flags.syn && flags.ack => {
-                // Process the SYN-ACK
-                self.mss = packet.options().mss.min(self.mss);
-                self.wnd_scl = packet.options().window_scale;
-                self.rcv_seq = packet.sequence_number();
-                self.rcv_timestamp = packet.options().timestamp.0;
-                self.rwnd = (packet.window_size() as u32) << self.wnd_scl;
-                self.smss = packet.options().mss;
-                self.init_cwnd();
-
-                // The ACK number in SYN-ACK points to our SYN sequence + 1
-                // Our next sequence number should be the ACK number from SYN-ACK
-                self.snd_ack = self.rcv_seq.wrapping_add(1);
-                self.rcv_seq_next = self.rcv_seq.wrapping_add(1);
-
-                // The server acknowledged our SYN, so our sequence number is incremented
-                // snd_seq was already set when we sent SYN, just increment it
-                self.snd_seq = self.snd_seq.wrapping_add(1);
-
-                // Send ACK to complete the three-way handshake
-                self.send_ack().await?;
-
-                self.state = TcpState::Established;
+                self.handle_syn_ack_in_syn_sent(packet).await
             }
             (TcpState::SynReceived, TcpEvent::SegmentArrives(flags)) if !flags.syn && flags.ack => {
-                self.rcv_seq = packet.sequence_number();
-
-                if self.prev_rcv_ack == 0 {
-                    self.prev_rcv_ack = packet.acknowledgment_number();
-                } else {
-                    self.prev_rcv_ack = self.rcv_ack;
-                }
-
-                self.rcv_ack = packet.acknowledgment_number();
-
-                self.state = TcpState::Established;
-
-                self.rcv_timestamp = packet.options().timestamp.0;
-
-                // НЕ вызываем send_pending_data при ACK на SYN-ACK
+                self.handle_ack_in_syn_received(packet).await
             }
             (TcpState::Established, TcpEvent::DataArrives) => {
-                self.rcv_timestamp = packet.options().timestamp.0;
-                self.snd_wnd_size = self.snd_wnd_size.wrapping_sub(packet.payload().len() as u32);
-
-                if packet.sequence_number() == self.rcv_seq_next {
-                    self.rcv_seq = packet.sequence_number();
-                    self.rwnd = (packet.window_size() as u32) << self.wnd_scl;
-                    self.rcv_seq_next = self.rcv_seq.wrapping_add(packet.payload().len() as u32);
-                    self.snd_ack = self.rcv_seq.wrapping_add(packet.payload().len() as u32);
-
-                    self.process_data(packet.clone()).await?;
-
-                    while let Some(data) = self.out_of_order_buffer.remove(&self.rcv_seq_next) {
-                        self.rcv_seq = data.sequence_number();
-                        self.rwnd = (data.window_size() as u32) << self.wnd_scl;
-                        self.rcv_seq_next = self.rcv_seq.wrapping_add(data.payload().len() as u32);
-                        self.snd_ack = self.rcv_seq.wrapping_add(data.payload().len() as u32);
-
-                        self.process_data(data.clone()).await?;
-                    }
-
-                    self.send_ack().await?;
-
-                } else if packet.sequence_number() > self.rcv_seq_next {
-                    self.buffer_out_of_order_data(packet.sequence_number(), packet);
-
-                    self.send_ack().await?;
-                }
+                self.handle_data_in_established(packet).await
+            }
+            (TcpState::FinWait1,  TcpEvent::SegmentArrives(flags)) if flags.ack => {
+                self.handle_ack_in_fin_wait1(packet).await
+            }
+            (TcpState::Established, TcpEvent::SegmentArrives(flags)) if flags.fin => {
+                self.handle_fin_in_established(packet).await
             }
             (TcpState::Established, TcpEvent::SegmentArrives(flags)) if !flags.syn && flags.ack => {
-                self.rcv_seq = packet.sequence_number();
-
-                if self.prev_rcv_ack == 0 {
-                    self.prev_rcv_ack = packet.acknowledgment_number();
-                } else {
-                    self.prev_rcv_ack = self.rcv_ack;
-                }
-
-                let new_ack = packet.acknowledgment_number();
-
-                self.rcv_timestamp = packet.options().timestamp.0;
-                let n = new_ack - self.prev_rcv_ack;
-                
-                // Проверяем, это дублирующий ACK (new_ack == prev_rcv_ack)
-                if n == 0 && self.prev_rcv_ack != 0 {
-                    self.dup_ack_count += 1;
-                    debug!("Duplicate ACK #{} received {} > {}", self.dup_ack_count, packet.source_socket(), packet.destination_socket());
-                    
-                    // Fast Retransmit после 3 дублирующих ACK
-                    if self.dup_ack_count == 3 && !self.fast_retransmit_done {
-                        self.fast_retransmit_done = true;
-
-                        self.ssthresh = (self.flight_size / 2).max(2 * self.smss as u32);
-                        self.cwnd = self.ssthresh + 3 * self.smss as u32;
-                        
-                        warn!("Fast Retransmit: ssthresh={}, cwnd={}", self.ssthresh, self.cwnd);
-                        
-                        // Находим первый неподтвержденный пакет и переотправляем его
-                        if let Some((seq, pending_pkt)) = self.unacked_packets.iter().next() {
-                            let seq = *seq;
-                            
-                            warn!("Fast Retransmit: retransmitting packet at seq={}", seq);
-                            
-                            let raw_packet = get_ack_data_response(
-                                self.snd_ack,
-                                self.source_addr,
-                                self.source_port,
-                                &pending_pkt.data,
-                                false,
-                                seq,
-                                self.destination_addr,
-                                self.destination_port,
-                                self.rcv_timestamp,
-                                65535,
-                            ).unwrap();
-
-                            if let Err(e) = (self.handler)(raw_packet).await {
-                                error!("Failed to retransmit packet {}", e);
-                            }
-                        }
-                    } else if self.dup_ack_count > 3 && self.fast_retransmit_done {
-                        self.cwnd += self.smss as u32;
-                        
-                        // Во время Fast Recovery отправляем новые данные если позволяет окно
-                        self.send_pending_data().await;
-                    }
-                } else if n > 0 {
-                    // Новый ACK - сбрасываем счетчик дублирующих ACK
-                    self.dup_ack_count = 0;
-                    self.fast_retransmit_done = false;
-                    
-                    // Удаляем подтвержденные пакеты и пересчитываем flight_size
-                    self.remove_acknowledged_packets(new_ack);
-                    
-                    // Увеличиваем cwnd только при получении ACK на данные (не SYN)
-                    self.cwnd += n.min(self.smss as u32);
-                    
-                    // После получения ACK на данные, отправляем pending данные
-                    self.send_pending_data().await;
-                }
-                
-                self.rwnd = (packet.window_size() as u32) << self.wnd_scl;
-                self.rcv_ack = new_ack;
+                self.handle_ack_in_established(packet).await
             }
-            (_, TcpEvent::RstArrives) => {
-                warn!(
-                    "process_event TcpEvent::RstArrives {} {}",
-                    packet.destination_socket().to_string(),
-                    packet.sequence_number()
-                );
-
-                self.read_buffer.clear();
-                self.app_buffer.clear();
-
-                self.state = TcpState::Closed;
-            }
+            (_, TcpEvent::RstArrives) => self.handle_rst(packet).await,
             (_, TcpEvent::Unknown) => {
                 warn!("++++++ process_event TcpEvent::Unknown");
+                Ok(())
             }
             _ => {
                 error!(
                     "Invalid state/event combination event {}, state {}",
                     event, old_state
                 );
-                return Err(std::io::Error::other(format!("Invalid state/event combination event {}, state {}", event, old_state)));
+                Err(std::io::Error::other(format!("Invalid state/event combination event {}, state {}", event, old_state)))
             }
-        };
+        }
+    }
+
+    /// Listen + SYN: инициализирует параметры соединения из опций клиента,
+    /// отвечает SYN-ACK и переходит в SynReceived.
+    async fn handle_syn_in_listen(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+        self.mss = packet.options().mss.min(self.mss);
+        self.wnd_scl = packet.options().window_scale;
+        self.rcv_seq = packet.sequence_number();
+        self.rcv_ack = packet.acknowledgment_number();
+
+        self.smss = packet.options().mss;
+        self.init_cwnd();
+
+        self.rcv_timestamp = packet.options().timestamp.0;
+        self.snd_ack = self.rcv_seq.wrapping_add(1);
+        self.rwnd = (packet.window_size() as u32) << self.wnd_scl;
+
+        self.send_syn_ack_packet().await?;
+
+        self.rcv_seq_next = self.rcv_seq.wrapping_add(1);
+        self.snd_seq = self.snd_seq.wrapping_add(1);
+
+        self.state = TcpState::SynReceived;
 
         Ok(())
     }
 
-    async fn send_ack_data(&mut self, data: Vec<u8>, psh: bool) {
+    /// SynSent + SYN-ACK: завершает трёхстороннее рукопожатие со стороны
+    /// активного открытия — обновляет параметры соединения и отправляет ACK.
+    async fn handle_syn_ack_in_syn_sent(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+        // Process the SYN-ACK
+        self.mss = packet.options().mss.min(self.mss);
+        self.wnd_scl = packet.options().window_scale;
+        self.rcv_seq = packet.sequence_number();
+        self.rcv_timestamp = packet.options().timestamp.0;
+        self.rwnd = (packet.window_size() as u32) << self.wnd_scl;
+        self.smss = packet.options().mss;
+        self.init_cwnd();
+
+        // The ACK number in SYN-ACK points to our SYN sequence + 1
+        // Our next sequence number should be the ACK number from SYN-ACK
+        self.snd_ack = self.rcv_seq.wrapping_add(1);
+        self.rcv_seq_next = self.rcv_seq.wrapping_add(1);
+
+        // The server acknowledged our SYN, so our sequence number is incremented
+        // snd_seq was already set when we sent SYN, just increment it
+        self.snd_seq = self.snd_seq.wrapping_add(1);
+
+        // Send ACK to complete the three-way handshake
+        self.send_ack().await?;
+
+        self.state = TcpState::Established;
+
+        Ok(())
+    }
+
+    /// SynReceived + ACK: ACK на наш SYN-ACK, соединение установлено.
+    async fn handle_ack_in_syn_received(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+        self.rcv_seq = packet.sequence_number();
+        self.update_prev_rcv_ack(packet.acknowledgment_number());
+
+        self.rcv_ack = packet.acknowledgment_number();
+
+        self.state = TcpState::Established;
+
+        self.rcv_timestamp = packet.options().timestamp.0;
+
+        // НЕ вызываем send_pending_data при ACK на SYN-ACK
+
+        Ok(())
+    }
+
+    /// Established + данные: кладёт упорядоченные сегменты в app_buffer,
+    /// неупорядоченные — в out_of_order_buffer, и отправляет ACK.
+    async fn handle_data_in_established(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+        self.rcv_timestamp = packet.options().timestamp.0;
+        self.snd_wnd_size = self.snd_wnd_size.wrapping_sub(packet.payload().len() as u32);
+
+        if packet.sequence_number() == self.rcv_seq_next {
+            self.accept_in_order_segment(&packet)?;
+
+            // Вычитываем сегменты, ставшие упорядоченными после прихода этого пакета
+            while let Some(data) = self.out_of_order_buffer.remove(&self.rcv_seq_next) {
+                self.accept_in_order_segment(&data)?;
+            }
+
+            self.send_ack().await?;
+
+        } else if packet.sequence_number() > self.rcv_seq_next {
+            self.buffer_out_of_order_data(packet.sequence_number(), packet);
+
+            self.send_ack().await?;
+        }
+
+        Ok(())
+    }
+
+    /// FinWait1 + ACK: наш FIN подтверждён, переходим в FinWait2.
+    async fn handle_ack_in_fin_wait1(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+        self.rcv_seq = packet.sequence_number();
+        self.rcv_ack = packet.acknowledgment_number();
+        self.rcv_timestamp = packet.options().timestamp.0;
+
+        self.state = TcpState::FinWait2;
+
+        Ok(())
+    }
+
+    /// Established + FIN: удалённая сторона закрывает соединение.
+    /// Подтверждаем FIN, сигнализируем EOF внешнему сокету, переходим в CloseWait.
+    async fn handle_fin_in_established(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+        self.rcv_seq = packet.sequence_number();
+        self.rcv_ack = packet.acknowledgment_number();
+        self.rcv_timestamp = packet.options().timestamp.0;
+
+        self.snd_ack = self.rcv_seq.wrapping_add(1);
+
+        self.state = TcpState::CloseWait;
+
+        // Закрываем канал, чтобы сигнализировать EOF внешнему сокету
+        self.end_data();
+
+        self.send_ack().await?;
+
+        Ok(())
+    }
+
+    /// Established + ACK: различает дублирующие и новые ACK и управляет
+    /// congestion control (Fast Retransmit / Fast Recovery / рост cwnd).
+    async fn handle_ack_in_established(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+        self.rcv_seq = packet.sequence_number();
+        self.update_prev_rcv_ack(packet.acknowledgment_number());
+
+        let new_ack = packet.acknowledgment_number();
+
+        self.rcv_timestamp = packet.options().timestamp.0;
+        let n = new_ack - self.prev_rcv_ack;
+
+        // Проверяем, это дублирующий ACK (new_ack == prev_rcv_ack)
+        if n == 0 && self.prev_rcv_ack != 0 {
+            self.handle_duplicate_ack(&packet).await;
+        } else if n > 0 {
+            self.handle_new_ack(new_ack, n).await;
+        }
+
+        self.rwnd = (packet.window_size() as u32) << self.wnd_scl;
+        self.rcv_ack = new_ack;
+
+        Ok(())
+    }
+
+    /// Обработка дублирующего ACK: увеличивает счётчик, после 3 дублирующих ACK
+    /// запускает Fast Retransmit, далее — Fast Recovery (раздувание cwnd).
+    async fn handle_duplicate_ack(&mut self, packet: &Ipv4TcpPacket) {
+        self.dup_ack_count += 1;
+        debug!("Duplicate ACK #{} received {} > {}", self.dup_ack_count, packet.source_socket(), packet.destination_socket());
+
+        // Fast Retransmit после 3 дублирующих ACK
+        if self.dup_ack_count == 3 && !self.fast_retransmit_done {
+            self.fast_retransmit_done = true;
+            self.do_fast_retransmit(packet).await;
+        } else if self.dup_ack_count > 3 && self.fast_retransmit_done {
+            self.cwnd += self.smss as u32;
+
+            // Во время Fast Recovery отправляем новые данные если позволяет окно
+            self.send_pending_data().await;
+        }
+    }
+
+    /// Fast Retransmit: уменьшает ssthresh вдвое, раздувает cwnd на 3 SMSS
+    /// и переотправляет старший неподтверждённый пакет.
+    async fn do_fast_retransmit(&mut self, packet: &Ipv4TcpPacket) {
+        self.ssthresh = (self.flight_size / 2).max(2 * self.smss as u32);
+        self.cwnd = self.ssthresh + 3 * self.smss as u32;
+
+        warn!("Fast Retransmit: ssthresh={}, cwnd={}", self.ssthresh, self.cwnd);
+
+        // Находим первый неподтвержденный пакет и переотправляем его
+        if let Some((seq, pending_pkt)) = self.unacked_packets.iter().next() {
+            let seq = *seq;
+
+            warn!("Fast Retransmit: retransmitting packet at seq={}", seq);
+
+            let raw_packet = get_ack_data_response(
+                self.snd_ack,
+                self.source_addr,
+                self.source_port,
+                &pending_pkt.data,
+                false,
+                seq,
+                self.destination_addr,
+                self.destination_port,
+                self.rcv_timestamp,
+                65535,
+            ).unwrap();
+
+            self.send_raw(raw_packet, "RETRANSMIT").await.ok();
+        } else {
+            warn!("Fast Retransmit {} > {}: retransmitting packet is not found. unacked_packets len {}", packet.source_socket(), packet.destination_socket(), self.unacked_packets.len());
+        }
+    }
+
+    /// Обработка нового ACK: сбрасывает счётчик дублирующих ACK, удаляет
+    /// подтверждённые пакеты, увеличивает cwnd на полученные байты
+    /// и отправляет pending данные.
+    async fn handle_new_ack(&mut self, new_ack: u32, n: u32) {
+        // Новый ACK - сбрасываем счетчик дублирующих ACK
+        self.dup_ack_count = 0;
+        self.fast_retransmit_done = false;
+
+        // Удаляем подтвержденные пакеты и пересчитываем flight_size
+        self.remove_acknowledged_packets(new_ack);
+
+        // Увеличиваем cwnd только при получении ACK на данные (не SYN)
+        self.cwnd += n.min(self.smss as u32);
+
+        // После получения ACK на данные, отправляем pending данные
+        self.send_pending_data().await;
+    }
+
+    /// RST: очищает буферы и переводит соединение в Closed.
+    async fn handle_rst(&mut self, packet: Ipv4TcpPacket) -> Result<(), std::io::Error> {
+        warn!(
+            "process_event TcpEvent::RstArrives {} {}",
+            packet.destination_socket().to_string(),
+            packet.sequence_number()
+        );
+
+        self.read_buffer.clear();
+        self.app_buffer.clear();
+
+        // После RST соединение абортнуто: очередь ретрансмиссий больше не нужна
+        self.unacked_packets.clear();
+        self.recalc_flight_size();
+
+        // Закрываем канал, чтобы сигнализировать EOF внешнему сокету
+        // (задача-писатель в handle_udp остановится через stream.closed)
+        self.end_data();
+
+        self.state = TcpState::Closed;
+
+        Ok(())
+    }
+
+    async fn send_fin(&mut self) {
+        let raw_packet = get_fin_response(
+            self.snd_ack,
+            self.destination_addr,
+            self.destination_port,
+            self.snd_seq,
+            self.source_addr,
+            self.source_port,
+            self.rcv_timestamp,
+            65535
+        ).unwrap();
+
+        if self.send_raw(raw_packet, "FIN").await.is_err() {
+            return;
+        }
+
+        self.snd_seq = self.snd_seq.wrapping_add(1);
+        self.state = TcpState::FinWait1;
+    }
+
+    /// Отправляет сегмент с данными, регистрирует его в unacked_packets
+    /// и продвигает snd_seq.
+    async fn send_data_segment(&mut self, data: Vec<u8>, psh: bool) -> Result<(), std::io::Error> {
         let data_size = data.len();
 
+        // ВАЖНО: окно в сегментах с данными/FIN захардкожено 65535, а не advertised_window(),
+        // т.к. snd_wnd_size уменьшается на размер принятых данных
         let raw_packet = get_ack_data_response(
             self.snd_ack,
             self.source_addr,
@@ -565,21 +682,28 @@ impl TcpStateMachine {
             self.destination_port,
             self.rcv_timestamp,
             65535,
-        )
-        .unwrap();
+        ).unwrap();
 
-        if let Err(e) = (self.handler)(raw_packet).await {
-            error!("Failed to send response {}", e);
-            return;
-        }
+        self.send_raw(raw_packet, "DATA").await?;
 
         self.add_to_unacked_packets(self.snd_seq, data, data_size);
         self.snd_seq = self.snd_seq.wrapping_add(data_size as u32);
+
+        Ok(())
     }
 
     async fn send_pending_data(&mut self) {
+        // После RST соединение закрыто — отправлять данные нельзя (в т.ч. из-за гонки:
+        // писатель мог забрать данные из write_buffer до выставления stream.closed)
+        if self.state == TcpState::Closed {
+            return;
+        }
+
         loop {
-            if self.send_buffer.is_empty() {
+            let send_buffer_cloned = self.send_buffer.clone();
+            let mut send_buffer = send_buffer_cloned.lock().await;
+
+            if send_buffer.is_empty() {
                 return;
             }
 
@@ -588,39 +712,36 @@ impl TcpStateMachine {
                 return;
             }
 
-            let send_size = (self.smss as u32).min(available_window - self.flight_size).min(self.send_buffer.len() as u32) as usize;
+            let send_size = (self.smss as u32).min(available_window - self.flight_size).min(send_buffer.len() as u32) as usize;
 
             if send_size == 0 {
                 return;
             }
 
-            let send_data: Vec<u8> = self.send_buffer.drain(0..send_size).collect();
+            let send_data: Vec<u8> = send_buffer.drain(0..send_size).collect();
+            let psh = send_buffer.is_empty();
 
-            let raw_packet = get_ack_data_response(
-                self.snd_ack,
-                self.source_addr,
-                self.source_port,
-                &send_data,
-                self.send_buffer.len() == 0,
-                self.snd_seq,
-                self.destination_addr,
-                self.destination_port,
-                self.rcv_timestamp,
-                65535,
-            ).unwrap();
-
-            if let Err(e) = (self.handler)(raw_packet).await {
-                error!("Failed to send response {}", e);
+            if self.send_data_segment(send_data, psh).await.is_err() {
                 return;
             }
-
-            self.add_to_unacked_packets(self.snd_seq, send_data, send_size);
-            self.snd_seq = self.snd_seq.wrapping_add(send_size as u32);
         }
     }
 
+    /// Закрывает канал read_buffer_tx, чтобы сигнализировать EOF
+    pub fn end_data(&mut self) {
+        self.read_buffer_tx.take();
+    }
+
+    pub fn close(&self) {
+        
+    }
+
     pub async fn try_send_data(&mut self, mut data: Vec<u8>) {
-        self.send_buffer.append(&mut data);
+        let mut send_buffer = self.send_buffer.lock().await;
+
+        send_buffer.append(&mut data);
+
+        drop(send_buffer);
 
         // Отправляем пакеты согласно Slow Start
         self.send_pending_data().await;
@@ -629,12 +750,11 @@ impl TcpStateMachine {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::{Error, ErrorKind}, net::{Ipv4Addr, SocketAddrV4}, time::{SystemTime, UNIX_EPOCH}};
+    use std::{io::{Error, ErrorKind}, net::{Ipv4Addr, SocketAddrV4}};
 
-    use etherparse::{PacketBuilder, TcpOptionElement};
     use tokio::sync::{mpsc::{UnboundedReceiver, unbounded_channel}};
 
-    use crate::{net_packet_parser::{IpTcpPacket, Ipv4TcpPacket, Packet, RawIpPacket, net_packet_parser}, tcp_state_machine::{TcpState, TcpStateMachine}};
+    use crate::{net_packet_parser::{IpTcpPacket, Ipv4TcpPacket, Packet, net_packet_parser}, tcp_state_machine::{TcpState, TcpStateMachine}};
 
     fn assert_state(actual: TcpState, expected: TcpState) {
         assert_eq!(
@@ -646,29 +766,32 @@ mod tests {
         );
     }
 
-    struct Client {
+    /// Тестовый пир (клиент или сервер) вокруг TcpStateMachine:
+    /// перехватывает исходящие пакеты в response_rx.
+    struct Peer {
         response_rx: UnboundedReceiver<Ipv4TcpPacket>,
         state: TcpStateMachine,
+        _read_rx: UnboundedReceiver<Vec<u8>>,
     }
 
-    impl Client {
-        fn new(
-            destination_socket: SocketAddrV4,
-            source_socket: SocketAddrV4,
-        ) -> Self {
+    impl Peer {
+        fn new(source_socket: SocketAddrV4, destination_socket: SocketAddrV4, listen: bool) -> Self {
             let (tx, rx) = unbounded_channel::<Ipv4TcpPacket>();
 
-            let state = TcpStateMachine::new(
+            let (read_tx, _read_rx) = unbounded_channel::<Vec<u8>>();
+
+            let mut state = TcpStateMachine::new(
                 *source_socket.ip(),
                 source_socket.port(),
                 *destination_socket.ip(),
                 destination_socket.port(),
+                read_tx,
                 Box::new(move |raw_response| {
                     let tx = tx.clone();
 
                     Box::pin(async move {
-                        if let Some(Packet::Ipv4Tcp(syn_ack_packet)) = net_packet_parser(raw_response.as_slice()) {
-                            tx.send(syn_ack_packet).map_err(|e| Error::new(ErrorKind::Other, e))?;
+                        if let Some(Packet::Ipv4Tcp(packet)) = net_packet_parser(raw_response.as_slice()) {
+                            tx.send(packet).map_err(|e| Error::new(ErrorKind::Other, e))?;
 
                             Ok(())
                         } else {
@@ -678,10 +801,23 @@ mod tests {
                 })
             );
 
-            Client {
+            if listen {
+                state.state = TcpState::Listen;
+            }
+
+            Peer {
                 response_rx: rx,
                 state,
+                _read_rx,
             }
+        }
+
+        fn new_client(source_socket: SocketAddrV4, destination_socket: SocketAddrV4) -> Self {
+            Self::new(source_socket, destination_socket, false)
+        }
+
+        fn new_server(source_socket: SocketAddrV4, destination_socket: SocketAddrV4) -> Self {
+            Self::new(source_socket, destination_socket, true)
         }
 
         async fn send_syn(&mut self, mss: Option<u16>) {
@@ -699,65 +835,6 @@ mod tests {
         async fn get_response(&mut self) -> Vec<Ipv4TcpPacket> {
             let mut result: Vec<Ipv4TcpPacket> = Vec::new();
 
-
-            while let Ok(packet) = self.response_rx.try_recv() {
-                result.push(packet);
-            }
-
-            result
-        }
-    }
-
-    struct Server {
-        response_rx: UnboundedReceiver<Ipv4TcpPacket>,
-        state: TcpStateMachine,
-    }
-
-    impl Server {
-        fn new(
-            destination_socket: SocketAddrV4,
-            source_socket: SocketAddrV4,
-        ) -> Self {
-            let (tx, rx) = unbounded_channel::<Ipv4TcpPacket>();
-
-            let mut state = TcpStateMachine::new(
-                *source_socket.ip(),
-                source_socket.port(),
-                *destination_socket.ip(),
-                destination_socket.port(),
-                Box::new(move |raw_response| {
-                    let tx = tx.clone();
-
-                    Box::pin(async move {
-                        if let Some(Packet::Ipv4Tcp(syn_ack_packet)) = net_packet_parser(raw_response.as_slice()) {
-                            tx.send(syn_ack_packet).map_err(|e| Error::new(ErrorKind::Other, e))?;
-
-                            Ok(())
-                        } else {
-                            panic!("syn_ack_packet should be ipv4");
-                        }
-                    })
-                })
-            );
-
-            state.state = TcpState::Listen;
-
-            let server = Server {
-                response_rx: rx,
-                state,
-            };
-
-            server
-        }
-
-        async fn accept_request(&mut self, packet: Ipv4TcpPacket) {
-            self.state.process_event(packet.clone()).await.unwrap();
-        }
-        
-        async fn get_response(&mut self) -> Vec<Ipv4TcpPacket> {
-            let mut result: Vec<Ipv4TcpPacket> = Vec::new();
-
-
             while let Ok(packet) = self.response_rx.try_recv() {
                 result.push(packet);
             }
@@ -765,50 +842,14 @@ mod tests {
             result
         }
 
-        async fn send_data(&mut self, data: Vec<u8>) {
-            self.state.try_send_data(data).await;
+        async fn close(&mut self) {
+            self.state.send_fin().await;
         }
-    }
-
-    pub fn get_syn_response(
-        destination_addr: &Ipv4Addr,
-        destination_port: u16,
-        mss: u16,
-        seq_num: u32,
-        source_addr: &Ipv4Addr,
-        source_port: u16,
-        win_size: u16,
-    ) -> Result<RawIpPacket, std::io::Error> {
-        let curr_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32;
-
-        let options = vec![
-            TcpOptionElement::MaximumSegmentSize(mss),
-            TcpOptionElement::Timestamp(curr_timestamp, 0),
-        ];
-
-        let builder = PacketBuilder::ipv4(source_addr.octets(), destination_addr.octets(), 64)
-            .tcp(source_port, destination_port, seq_num, win_size)
-            .syn();
-
-        let builder_with_options = builder
-            .options(options.as_slice())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-        let payload = Vec::<u8>::new();
-
-        let mut buffer = Vec::<u8>::with_capacity(builder_with_options.size(payload.len()));
-
-        builder_with_options.write(&mut buffer, &payload).unwrap();
-
-        Ok(buffer)
     }
 
     async fn assert_client_send_data(
-        client: &mut Client,
-        server: &mut Server,
+        client: &mut Peer,
+        server: &mut Peer,
     ) {
         let data = "123456789";
 
@@ -845,14 +886,14 @@ mod tests {
             8001,
         );
 
-        let mut server = Server::new(
-            client_socket,
+        let mut server = Peer::new_server(
             server_socket,
+            client_socket,
         );
 
-        let mut client = Client::new(
+        let mut client = Peer::new_client(
+            client_socket,
             server_socket,
-            client_socket
         );
 
         let mut net_server_client_tick = 0;
@@ -1009,7 +1050,7 @@ mod tests {
         net_client_server.append(&mut client.get_response().await);
 
         server.accept_request(net_client_server.remove(0)).await;
-        net_client_server.append(&mut client.get_response().await);
+        net_server_client.append(&mut server.get_response().await);
         assert_eq!(server.state.cwnd, 25);
         assert_eq!(server.state.flight_size, 6);
         assert_eq!(net_server_client.len(), 11); // 012, 345, 678, 9ab, cde, fgh, 345, jkl, m, nop, qr
@@ -1021,7 +1062,7 @@ mod tests {
         net_client_server.append(&mut client.get_response().await);
 
         server.accept_request(net_client_server.remove(0)).await;
-        net_client_server.append(&mut client.get_response().await);
+        net_server_client.append(&mut server.get_response().await);
         assert_eq!(server.state.cwnd, 26);
         assert_eq!(server.state.flight_size, 5);
         assert_eq!(net_server_client.len(), 11); // 012, 345, 678, 9ab, cde, fgh, 345, jkl, m, nop, qr
@@ -1033,7 +1074,7 @@ mod tests {
         net_client_server.append(&mut client.get_response().await);
 
         server.accept_request(net_client_server.remove(0)).await;
-        net_client_server.append(&mut client.get_response().await);
+        net_server_client.append(&mut server.get_response().await);
         assert_eq!(server.state.cwnd, 29);
         assert_eq!(server.state.flight_size, 2);
         assert_eq!(net_server_client.len(), 11); // 012, 345, 678, 9ab, cde, fgh, 345, jkl, m, nop, qr
@@ -1045,11 +1086,40 @@ mod tests {
         net_client_server.append(&mut client.get_response().await);
 
         server.accept_request(net_client_server.remove(0)).await;
-        net_client_server.append(&mut client.get_response().await);
+        net_server_client.append(&mut server.get_response().await);
         assert_eq!(server.state.cwnd, 31);
         assert_eq!(server.state.flight_size, 0);
         assert_eq!(net_server_client.len(), 11); // 012, 345, 678, 9ab, cde, fgh, 345, jkl, m, nop, qr
 
-        assert_eq!(String::from_utf8_lossy(client.state.read_buffer.as_slice()), server_data);
+        if let Some(result) = client._read_rx.recv().await {
+            assert_eq!(String::from_utf8_lossy(result.as_slice()), server_data);
+        } else {
+            panic!("client should receive data");
+        }
+
+        server.close().await;
+        net_server_client.append(&mut server.get_response().await);
+        match server.state.state {
+            TcpState::FinWait1 => {}
+            _ => panic!("State should be TcpState::FinWait1. Current is {}", server.state.state)
+        }
+
+        net_server_client_tick = 11;
+
+        client.accept_request(net_server_client[net_server_client_tick].clone()).await;
+        match client.state.state {
+            TcpState::CloseWait => {},
+            _ => panic!("State should be TcpState::CloseWait. Current is {}", client.state.state)
+        }
+        net_client_server.append(&mut client.get_response().await);
+        let packet = net_client_server.remove(0);
+        assert_eq!(packet.acknowledgment_number(), net_server_client[net_server_client_tick].sequence_number().wrapping_add(1));
+
+        server.accept_request(packet).await;
+        match server.state.state {
+            TcpState::FinWait2 => {},
+            _ => panic!("State should be TcpState::FinWait2. Current is {}", server.state.state)
+        }
+
     }
 }

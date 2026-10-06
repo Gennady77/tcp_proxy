@@ -1,4 +1,6 @@
 /target
 /logs
 /.cargo
+/.claude
+CLAUDE.md
 .DS_Store

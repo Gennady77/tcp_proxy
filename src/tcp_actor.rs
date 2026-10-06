@@ -49,7 +49,7 @@ impl TcpHandle {
 }
 
 pub struct TcpActor {
-    state: TcpStateMachine,
+    pub state: TcpStateMachine,
     cmd_rx: UnboundedReceiver<TcpCommand>,
     read_tx: UnboundedSender<TcpActorEvent>,
 }
@@ -66,11 +66,14 @@ impl TcpActor {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (read_tx, read_rx) = unbounded_channel();
 
+        let (read_buffer_tx, _read_buffer_rx) = unbounded_channel::<Vec<u8>>();
+
         let mut state = TcpStateMachine::new(
             source_addr,
             source_port,
             destination_addr,
             destination_port,
+            read_buffer_tx,
             Box::new(move |packet| {
                 let socket_cloned = Arc::clone(&socket);
 
