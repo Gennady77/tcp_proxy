@@ -1,14 +1,14 @@
 use rand::Rng;
-use tokio::{sync::{Mutex, mpsc::UnboundedSender}};
 use std::{
-    collections::{BTreeMap, btree_map::Entry}, fmt::Display, net::Ipv4Addr, sync::Arc, time::Instant, u32
+    collections::{BTreeMap, btree_map::Entry}, fmt::Display, net::Ipv4Addr, sync::{Arc, Mutex as StdMutex}, time::Instant, u32
 };
+use tokio::sync::Notify;
 use tracing::{debug, error, warn};
 
 use crate::{
     net_packet_parser::{
         IpTcpPacket, Ipv4TcpPacket, RawIpPacket, TcpFlags, TcpPacket, get_ack_data_response, get_ack_response, get_fin_response, get_handshake_response, get_syn_response
-    }, utils::PacketHandler
+    }, tcp_stream::{ConnShared, new_conn_shared}, utils::PacketHandler
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -94,7 +94,7 @@ pub struct TcpStateMachine {
     snd_wnd_scl: u8,
 
     // --- Состояние FSM ---
-    pub state: TcpState,
+    state: TcpState,
     prev_rcv_ack: u32,
 
     // --- Приём (receive path) ---
@@ -104,15 +104,20 @@ pub struct TcpStateMachine {
     rcv_timestamp: u32,
     rwnd: u32,
     snd_wnd_size: u32,
-    app_buffer: Vec<u8>,
+    /// Приёмный буфер FSM: реассембляция in-order сегментов, флаш в ConnShared по PSH
+    recv_buffer: Vec<u8>,
     out_of_order_buffer: BTreeMap<u32, Ipv4TcpPacket>,
-    pub read_buffer: Vec<u8>,
-    read_buffer_tx: Option<UnboundedSender<Vec<u8>>>,
+
+    // --- Мост к AsyncRead/AsyncWrite-половинкам (см. tcp_stream.rs) ---
+    shared: Arc<StdMutex<ConnShared>>,
+    notify: Arc<Notify>,
 
     // --- Передача (send path) ---
     snd_seq: u32,
     snd_ack: u32,
-    pub send_buffer: Arc<Mutex<Vec<u8>>>,
+    /// Очередь на отправку: драйвер перекачивает сюда данные из ConnShared,
+    /// send_pending_data сегментирует очередь согласно cwnd/rwnd
+    send_queue: Vec<u8>,
     unacked_packets: BTreeMap<u32, PendingPacket>,
 
     // --- Управление перегрузкой (RFC 5681) ---
@@ -129,10 +134,11 @@ impl TcpStateMachine {
         source_port: u16,
         destination_addr: Ipv4Addr,
         destination_port: u16,
-        read_buffer_tx: UnboundedSender<Vec<u8>>,
         handler: PacketHandler,
     ) -> Self {
         let mut rng = rand::rng();
+
+        let (shared, notify) = new_conn_shared();
 
         Self {
             // --- Конфигурация соединения ---
@@ -157,15 +163,17 @@ impl TcpStateMachine {
             rcv_timestamp: 0,
             rwnd: 0,
             snd_wnd_size: 65535 << 10,
-            app_buffer: Vec::new(),
+            recv_buffer: Vec::new(),
             out_of_order_buffer: BTreeMap::new(),
-            read_buffer: Vec::new(),
-            read_buffer_tx: Some(read_buffer_tx),
+
+            // --- Мост к половинкам ---
+            shared,
+            notify,
 
             // --- Передача (send path) ---
             snd_seq: rng.next_u32(),
             snd_ack: 0,
-            send_buffer: Arc::new(Mutex::new(Vec::new())),
+            send_queue: Vec::new(),
             unacked_packets: BTreeMap::new(),
 
             // --- Управление перегрузкой (RFC 5681) ---
@@ -175,6 +183,40 @@ impl TcpStateMachine {
             dup_ack_count: 0,
             fast_retransmit_done: false,
         }
+    }
+
+    /// FSM в состоянии Listen (пассивное открытие — входящее соединение).
+    /// Заменяет внешнюю мутацию `state.state = TcpState::Listen`.
+    pub fn new_listen(
+        source_addr: Ipv4Addr,
+        source_port: u16,
+        destination_addr: Ipv4Addr,
+        destination_port: u16,
+        handler: PacketHandler,
+    ) -> Self {
+        let mut fsm = Self::new(source_addr, source_port, destination_addr, destination_port, handler);
+        fsm.state = TcpState::Listen;
+        fsm
+    }
+
+    /// Текущее состояние FSM.
+    pub fn state(&self) -> TcpState {
+        self.state
+    }
+
+    /// Read-половинка потока поверх приёмного буфера FSM.
+    pub(crate) fn recv_half(&self) -> crate::tcp_stream::TcpRecvHalf {
+        crate::tcp_stream::TcpRecvHalf::new(Arc::clone(&self.shared), Arc::clone(&self.notify))
+    }
+
+    /// Send-половинка потока поверх отправного буфера FSM.
+    pub(crate) fn send_half(&self) -> crate::tcp_stream::TcpSendHalf {
+        crate::tcp_stream::TcpSendHalf::new(Arc::clone(&self.shared), Arc::clone(&self.notify))
+    }
+
+    /// Уведомитель драйвера: пробуждение для pump_send.
+    pub(crate) fn notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
     }
 
     /// Размер окна, анонсируемый в исходящих пакетах (учитывает window scale)
@@ -207,16 +249,21 @@ impl TcpStateMachine {
         let data = packet.payload();
         let push_flag = packet.psh();
 
-        self.app_buffer.extend(data.as_slice());
+        self.recv_buffer.extend(data.as_slice());
 
+        // Флаш приёмного буфера в read-половинку по PSH (семантика сохранена
+        // сознательно; непрерывный поток — отдельная задача, не в этом рефакторинге)
         if push_flag {
-            let data_buff = std::mem::take(&mut self.app_buffer);
-
-            if let Some(tx) = self.read_buffer_tx.as_ref() {
-                tx.send(data_buff).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            }
+            self.flush_recv();
         }
         Ok(())
+    }
+
+    /// Выгружает приёмный буфер FSM в ConnShared и будит ждущего читателя.
+    fn flush_recv(&mut self) {
+        let data = std::mem::take(&mut self.recv_buffer);
+
+        self.shared.lock().unwrap().push_recv(&data);
     }
 
     /// Обрабатывает сегмент, пришедший в порядке очереди: обновляет rcv-состояние
@@ -519,8 +566,8 @@ impl TcpStateMachine {
 
         self.state = TcpState::CloseWait;
 
-        // Закрываем канал, чтобы сигнализировать EOF внешнему сокету
-        self.end_data();
+        // EOF на read-половинке: пир закрыл свою сторону
+        self.set_recv_eof();
 
         self.send_ack().await?;
 
@@ -628,16 +675,19 @@ impl TcpStateMachine {
             packet.sequence_number()
         );
 
-        self.read_buffer.clear();
-        self.app_buffer.clear();
+        self.recv_buffer.clear();
 
         // После RST соединение абортнуто: очередь ретрансмиссий больше не нужна
         self.unacked_packets.clear();
         self.recalc_flight_size();
 
-        // Закрываем канал, чтобы сигнализировать EOF внешнему сокету
-        // (задача-писатель в handle_udp остановится через stream.closed)
-        self.end_data();
+        // Отправной путь тоже закрывается: накопленные, но не отправленные
+        // данные после RST уходить не должны
+        self.send_queue.clear();
+        self.shared.lock().unwrap().take_send();
+
+        // EOF на read-половинке: соединение абортнуто
+        self.set_recv_eof();
 
         self.state = TcpState::Closed;
 
@@ -662,6 +712,9 @@ impl TcpStateMachine {
 
         self.snd_seq = self.snd_seq.wrapping_add(1);
         self.state = TcpState::FinWait1;
+
+        // FIN фактически ушёл в сеть — будим ждущий poll_shutdown
+        self.shared.lock().unwrap().set_fin_sent();
     }
 
     /// Отправляет сегмент с данными, регистрирует его в unacked_packets
@@ -694,32 +747,25 @@ impl TcpStateMachine {
 
     async fn send_pending_data(&mut self) {
         // После RST соединение закрыто — отправлять данные нельзя (в т.ч. из-за гонки:
-        // писатель мог забрать данные из write_buffer до выставления stream.closed)
+        // писатель мог забрать данные из send_buf до выставления recv_eof)
         if self.state == TcpState::Closed {
             return;
         }
 
-        loop {
-            let send_buffer_cloned = self.send_buffer.clone();
-            let mut send_buffer = send_buffer_cloned.lock().await;
-
-            if send_buffer.is_empty() {
-                return;
-            }
-
+        while !self.send_queue.is_empty() {
             let available_window = self.cwnd.min(self.rwnd);
             if self.flight_size >= available_window {
                 return;
             }
 
-            let send_size = (self.smss as u32).min(available_window - self.flight_size).min(send_buffer.len() as u32) as usize;
+            let send_size = (self.smss as u32).min(available_window - self.flight_size).min(self.send_queue.len() as u32) as usize;
 
             if send_size == 0 {
                 return;
             }
 
-            let send_data: Vec<u8> = send_buffer.drain(0..send_size).collect();
-            let psh = send_buffer.is_empty();
+            let send_data: Vec<u8> = self.send_queue.drain(0..send_size).collect();
+            let psh = self.send_queue.is_empty();
 
             if self.send_data_segment(send_data, psh).await.is_err() {
                 return;
@@ -727,24 +773,41 @@ impl TcpStateMachine {
         }
     }
 
-    /// Закрывает канал read_buffer_tx, чтобы сигнализировать EOF
-    pub fn end_data(&mut self) {
-        self.read_buffer_tx.take();
-    }
+    /// Перекачивает данные, накопленные write-половинкой в ConnShared, в очередь
+    /// на отправку и отправляет сегменты согласно cwnd/rwnd.
+    /// Вызывается драйвером при пробуждении notify.
+    pub async fn pump_send(&mut self) {
+        // take_send забирает данные и будит ждущего писателя (освободилось место)
+        let data = self.shared.lock().unwrap().take_send();
 
-    pub fn close(&self) {
-        
-    }
+        if !data.is_empty() {
+            self.send_queue.extend_from_slice(&data);
+        }
 
-    pub async fn try_send_data(&mut self, mut data: Vec<u8>) {
-        let mut send_buffer = self.send_buffer.lock().await;
-
-        send_buffer.append(&mut data);
-
-        drop(send_buffer);
-
-        // Отправляем пакеты согласно Slow Start
         self.send_pending_data().await;
+
+        // Shutdown write-половинки: после осушения очереди отправляем FIN
+        if self.send_queue.is_empty() && self.shared.lock().unwrap().shutdown_pending() {
+            self.close().await;
+        }
+    }
+
+    /// Ставит EOF на read-половинку (FIN или RST от пира) и будит читателя.
+    fn set_recv_eof(&mut self) {
+        self.shared.lock().unwrap().set_recv_eof();
+    }
+
+    /// Закрытие соединения со стороны прокси: отправка FIN пиру.
+    /// Полная машина закрытия (LastAck, TimeWait, повторные FIN) — вне скоупа.
+    pub async fn close(&mut self) {
+        match self.state {
+            // Активное закрытие: Established/SynReceived → FinWait1
+            TcpState::Established | TcpState::SynReceived => self.send_fin().await,
+            // Пир уже закрыл свою сторону (EOF отдан читателю) — отвечаем FIN
+            TcpState::CloseWait => self.send_fin().await,
+            // Closed/SynSent/FinWait1/FinWait2 — закрытие уже идёт или завершено
+            _ => {}
+        }
     }
 }
 
@@ -752,7 +815,7 @@ impl TcpStateMachine {
 mod tests {
     use std::{io::{Error, ErrorKind}, net::{Ipv4Addr, SocketAddrV4}};
 
-    use tokio::sync::{mpsc::{UnboundedReceiver, unbounded_channel}};
+    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{UnboundedReceiver, unbounded_channel}}};
 
     use crate::{net_packet_parser::{IpTcpPacket, Ipv4TcpPacket, Packet, net_packet_parser}, tcp_state_machine::{TcpState, TcpStateMachine}};
 
@@ -771,21 +834,21 @@ mod tests {
     struct Peer {
         response_rx: UnboundedReceiver<Ipv4TcpPacket>,
         state: TcpStateMachine,
-        _read_rx: UnboundedReceiver<Vec<u8>>,
+        /// Read-половинка потока: сюда FSM выгружает принятые данные
+        recv: crate::tcp_stream::TcpRecvHalf,
+        /// Write-половинка потока: данные отсюда драйвер (pump_send) забирает в FSM
+        send: crate::tcp_stream::TcpSendHalf,
     }
 
     impl Peer {
         fn new(source_socket: SocketAddrV4, destination_socket: SocketAddrV4, listen: bool) -> Self {
             let (tx, rx) = unbounded_channel::<Ipv4TcpPacket>();
 
-            let (read_tx, _read_rx) = unbounded_channel::<Vec<u8>>();
-
             let mut state = TcpStateMachine::new(
                 *source_socket.ip(),
                 source_socket.port(),
                 *destination_socket.ip(),
                 destination_socket.port(),
-                read_tx,
                 Box::new(move |raw_response| {
                     let tx = tx.clone();
 
@@ -801,6 +864,9 @@ mod tests {
                 })
             );
 
+            let recv = state.recv_half();
+            let send = state.send_half();
+
             if listen {
                 state.state = TcpState::Listen;
             }
@@ -808,7 +874,8 @@ mod tests {
             Peer {
                 response_rx: rx,
                 state,
-                _read_rx,
+                recv,
+                send,
             }
         }
 
@@ -825,7 +892,9 @@ mod tests {
         }
 
         async fn send_data(&mut self, data: Vec<u8>) {
-            self.state.try_send_data(data).await;
+            // Как в реальном прокси: write-половинка → драйвер (pump_send)
+            self.send.write_all(&data).await.unwrap();
+            self.state.pump_send().await;
         }
 
         async fn accept_request(&mut self, packet: Ipv4TcpPacket) {
@@ -948,7 +1017,9 @@ mod tests {
         // Клиент принимает первый пакет из сети и генерит ack
         client.accept_request(net_server_client[net_server_client_tick].clone()).await;
         net_client_server.append(&mut client.get_response().await);
-        assert_eq!(String::from_utf8_lossy(client.state.app_buffer.as_slice()), "012");
+        // «012» пришёл без PSH — данные накапливаются в приёмном буфере FSM
+        // и уйдут в recv-половинку при следующем флаше по PSH
+        assert_eq!(String::from_utf8_lossy(client.state.recv_buffer.as_slice()), "012");
 
         // запоминаем ack этого пакета
         let last_ack_in_order = net_client_server[0].acknowledgment_number();
@@ -1091,11 +1162,11 @@ mod tests {
         assert_eq!(server.state.flight_size, 0);
         assert_eq!(net_server_client.len(), 11); // 012, 345, 678, 9ab, cde, fgh, 345, jkl, m, nop, qr
 
-        if let Some(result) = client._read_rx.recv().await {
-            assert_eq!(String::from_utf8_lossy(result.as_slice()), server_data);
-        } else {
-            panic!("client should receive data");
-        }
+        // Все данные, отправленные сервером, дошли до recv-половинки клиента:
+        // финальный сегмент «qr» идёт с PSH и флашит весь накопленный буфер
+        let mut received = vec![0u8; server_data.len()];
+        client.recv.read_exact(&mut received).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(received.as_slice()), server_data);
 
         server.close().await;
         net_server_client.append(&mut server.get_response().await);

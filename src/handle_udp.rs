@@ -1,19 +1,14 @@
 use rand::Rng;
-use tokio::sync::mpsc::unbounded_channel;
 use std::sync::Arc;
 use std::{
-    cmp::min,
     collections::HashMap,
     error::Error,
     net::{SocketAddr, SocketAddrV4},
-    task::{Poll, Waker},
-    time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, copy},
+    io::{AsyncWriteExt, copy},
     net::{TcpStream, UdpSocket},
-    sync::Mutex,
-    time::sleep,
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
 use tracing::{debug, error, info, warn};
 
@@ -22,215 +17,99 @@ use crate::{
     net_packet_parser::{
         IpTcpPacket, Ipv4TcpPacket, Packet, get_reset_response, net_packet_parser,
     },
-    tcp_actor::{TcpActor, TcpActorEvent, TcpHandle},
-    utils::dump_raw_packet,
+    tcp_stream::{TcpRecvHalf, TcpSendHalf},
+    utils,
 };
 
-struct ReadHalf {
-    buffer: Arc<Mutex<Vec<u8>>>,
-    waker: Arc<Mutex<Option<Waker>>>,
-    closed: Arc<Mutex<bool>>,
+/// Ключ потока соединений: пара сокетов (источник, назначение).
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+struct FlowKey {
+    source: SocketAddr,
+    destination: SocketAddr,
 }
 
-struct WriteHalf {
-    buffer: Arc<Mutex<Vec<u8>>>,
-    closed: Arc<Mutex<bool>>,
+impl FlowKey {
+    fn from_packet(packet: &Ipv4TcpPacket) -> Self {
+        Self {
+            source: packet.source_socket(),
+            destination: packet.destination_socket(),
+        }
+    }
+}
+
+/// Событие соединения: пакет от пира или команда закрытия от прокси-пайпа.
+enum ConnEvent {
+    Packet(Ipv4TcpPacket),
+    Close,
+}
+
+/// Управление таблицей потоков: команды от задач соединений.
+enum FlowControl {
+    Remove(FlowKey),
 }
 
 struct IpUdpStream {
-    closed: Arc<Mutex<bool>>,
     destination_socket_addr: SocketAddr,
-    read_buffer: Arc<Mutex<Vec<u8>>>,
-    read_waker: Arc<Mutex<Option<Waker>>>,
-    write_buffer: Arc<Mutex<Vec<u8>>>,
-    state: Arc<Mutex<TcpStateMachine>>
+    /// Read-половинка потока поверх FSM (см. tcp_stream.rs)
+    recv: TcpRecvHalf,
+    /// Write-половинка потока поверх FSM
+    send: TcpSendHalf,
+    /// Команды задаче соединения (Close и т.п.)
+    control_tx: UnboundedSender<ConnEvent>,
 }
 
 impl IpUdpStream {
-    fn new(destination_socket_addr: SocketAddr, state: Arc<Mutex<TcpStateMachine>>) -> Self {
+    fn new(
+        destination_socket_addr: SocketAddr,
+        recv: TcpRecvHalf,
+        send: TcpSendHalf,
+        control_tx: UnboundedSender<ConnEvent>,
+    ) -> Self {
         Self {
-            closed: Arc::new(Mutex::new(false)),
             destination_socket_addr,
-            read_buffer: Arc::new(Mutex::new(Vec::new())),
-            read_waker: Arc::new(Mutex::new(None)),
-            write_buffer: Arc::new(Mutex::new(Vec::new())),
-            state,
+            recv,
+            send,
+            control_tx,
         }
     }
 
-    fn split(&self) -> (ReadHalf, WriteHalf) {
-        let read_buffer = self.read_buffer.clone();
-        let read_waker = self.read_waker.clone();
-        let write_buffer = self.write_buffer.clone();
-
-        let read_half = ReadHalf {
-            buffer: read_buffer,
-            waker: read_waker,
-            closed: self.closed.clone(),
-        };
-
-        let write_half = WriteHalf {
-            buffer: write_buffer,
-            closed: self.closed.clone(),
-        };
-
-        (read_half, write_half)
-    }
-
-    pub async fn is_closed(&self) -> bool {
-        let closed_guard = self.closed.lock().await;
-
-        *closed_guard
+    fn split(&self) -> (TcpRecvHalf, TcpSendHalf) {
+        (self.recv.clone(), self.send.clone())
     }
 
     pub async fn close(&self) {
-        let state = self.state.lock().await;
-
-        state.close();
-    }
-}
-
-impl AsyncWrite for WriteHalf {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let write_buffer = this.buffer.clone();
-
-        let closed = match this.closed.try_lock() {
-            Ok(cls) => *cls,
-            Err(_) => return Poll::Pending,
-        };
-
-        if closed {
-            return Poll::Ready(Ok(0));
-        }
-
-        match write_buffer.try_lock() {
-            Ok(mut wb) => {
-                let bytes_to_write = buf.len();
-
-                wb.extend_from_slice(buf);
-
-                Poll::Ready(Ok(bytes_to_write))
-            }
-            Err(_) => Poll::Pending,
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let write_buffer = this.buffer.clone();
-
-        match write_buffer.try_lock() {
-            Ok(wb) => {
-                if wb.is_empty() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
-            Err(_) => Poll::Pending,
-        }
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.poll_flush(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncRead for ReadHalf {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let read_buffer = self.buffer.clone();
-        let waker_clone = self.waker.clone();
-        let closed = self.closed.clone();
-
-        match read_buffer.try_lock() {
-            Ok(mut rb) => {
-                let mut waker = match waker_clone.try_lock() {
-                    Ok(wk) => wk,
-                    Err(_) => {
-                        return Poll::Pending;
-                    }
-                };
-
-                // Если буфер пуст и соединение закрыто — это EOF
-                if rb.is_empty() {
-                    let is_closed = match closed.try_lock() {
-                        Ok(c) => *c,
-                        Err(_) => false,
-                    };
-
-                    if is_closed {
-                        debug!("AsyncRead poll_read EOF");
-                        return Poll::Ready(Ok(()));
-                    }
-
-                    *waker = Some(cx.waker().clone());
-                    return Poll::Pending;
-                }
-
-                let available = rb.len();
-                let to_read = min(available, buf.remaining());
-
-                let dst = buf.initialize_unfilled_to(to_read);
-                dst.copy_from_slice(&rb[..to_read]);
-                buf.advance(to_read);
-
-                rb.drain(..to_read);
-
-                debug!("AsyncRead poll_read Poll::Ready(Ok(()))");
-
-                Poll::Ready(Ok(()))
-            }
-            Err(_) => {
-                let mut waker = match waker_clone.try_lock() {
-                    Ok(wk) => wk,
-                    Err(_) => {
-                        return Poll::Pending;
-                    }
-                };
-
-                *waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
+        let _ = self.control_tx.send(ConnEvent::Close);
     }
 }
 
 struct IpOverUdpServer {
     socket: Arc<UdpSocket>,
-    conections: HashMap<(String, String), Arc<IpUdpStream>>,
+    connections: HashMap<FlowKey, UnboundedSender<ConnEvent>>,
+    /// Команды от задач соединений (чистка таблицы)
+    flow_control_tx: UnboundedSender<FlowControl>,
+    flow_control_rx: UnboundedReceiver<FlowControl>,
 }
 
 impl IpOverUdpServer {
     async fn new(bind_addr: &str) -> Result<Self, Box<dyn Error>> {
         let socket = UdpSocket::bind(bind_addr).await?;
+        let (flow_control_tx, flow_control_rx) = unbounded_channel::<FlowControl>();
 
         Ok(Self {
             socket: Arc::new(socket),
-            conections: HashMap::new(),
+            connections: HashMap::new(),
+            flow_control_tx,
+            flow_control_rx,
         })
     }
 
     async fn run(&mut self) -> Result<Arc<IpUdpStream>, Box<dyn Error>> {
         loop {
+            // Чистим таблицу: задачи соединений сообщают о завершении
+            while let Ok(FlowControl::Remove(key)) = self.flow_control_rx.try_recv() {
+                self.connections.remove(&key);
+            }
+
             match self.recv().await {
                 Ok(Some(stream)) => {
                     return Ok(stream);
@@ -307,163 +186,59 @@ impl IpOverUdpServer {
         packet: Ipv4TcpPacket,
         socket_addr: SocketAddr,
     ) -> Result<Option<Arc<IpUdpStream>>, std::io::Error> {
+        let key = FlowKey::from_packet(&packet);
+
         if packet.syn() && !packet.ack() {
             let socket = Arc::clone(&self.socket);
 
-            let (read_tx, mut read_rx) = unbounded_channel::<Vec<u8>>();
-
-            // let (handle, mut read_rx, mut actor) = TcpActor::new(
-            //     socket,
-            //     socket_addr,
-            //     packet.ip.source_address,
-            //     packet.tcp.source_port,
-            //     packet.ip.destination_address,
-            //     packet.tcp.destination_port,
-            // );
-
-            let mut state = TcpStateMachine::new(
+            let fsm = TcpStateMachine::new_listen(
                 packet.ip.source_address,
                 packet.tcp.source_port,
                 packet.ip.destination_address,
                 packet.tcp.destination_port,
-                read_tx,
                 Box::new(move |resp_packet| {
                     let socket_cloned = Arc::clone(&socket);
 
-                    Box::pin(async move { send_response(&resp_packet, &socket_cloned, socket_addr).await })
+                    Box::pin(async move { utils::send_response(resp_packet, socket_cloned, socket_addr).await })
                 }),
             );
 
-            state.state = TcpState::Listen;
+            let recv_half = fsm.recv_half();
+            let send_half = fsm.send_half();
 
-            let state = Arc::new(Mutex::new(state));
-            let state_cloned = state.clone();
+            // Per-flow канал: пакеты этого соединения обрабатывает его задача
+            let (event_tx, event_rx) = unbounded_channel::<ConnEvent>();
+
+            self.connections.insert(key.clone(), event_tx.clone());
 
             let stream = Arc::new(IpUdpStream::new(
                 SocketAddr::V4(SocketAddrV4::new(
                     packet.ip.destination_address,
                     packet.tcp.destination_port,
                 )),
-                state_cloned,
+                recv_half,
+                send_half,
+                event_tx.clone(),
             ));
 
-            // tokio::spawn(async move {
-            //     if let Err(e) = actor.run().await {
-            //         error!("Failed to raun actor {}", e);
-            //     }
-            // });
+            // Задача соединения — единственный владелец FSM
+            tokio::spawn(conn_task(
+                fsm,
+                event_rx,
+                self.flow_control_tx.clone(),
+                key,
+            ));
 
-            let stream_cloned = stream.clone();
-            let state_cloned = state.clone();
-
-            tokio::spawn(async move {
-                loop {
-                    match read_rx.recv().await {
-                        Some(mut data) => {
-                            let mut rb = stream_cloned.read_buffer.lock().await;
-
-                            rb.append(&mut data);
-
-                            let waker_clone = stream_cloned.read_waker.clone();
-                            let mut waker = waker_clone.lock().await;
-
-                            if let Some(waker) = waker.take() {
-                                waker.wake();
-                            }
-                        }
-                        None => {
-                            // Канал закрыт — это EOF, сигнализируем ReadHalf
-                            let mut closed_guard = stream_cloned.closed.lock().await;
-                            *closed_guard = true;
-                            // Пробуждаем ожидающий read
-                            let waker_clone = stream_cloned.read_waker.clone();
-                            if let Ok(mut waker) = waker_clone.try_lock() {
-                                if let Some(waker) = waker.take() {
-                                    waker.wake();
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-            });
-
-            // tokio::spawn(async move {
-            //     loop {
-            //         match read_rx.recv().await {
-            //             Some(TcpActorEvent::Data(mut data)) => {
-            //                 let mut rb = stream_cloned.read_buffer.lock().await;
-
-            //                 rb.append(&mut data);
-
-            //                 let waker_clone = stream_cloned.read_waker.clone();
-            //                 let mut waker = waker_clone.lock().await;
-
-            //                 if let Some(waker) = waker.take() {
-            //                     waker.wake();
-            //                 }
-            //             }
-            //             Some(TcpActorEvent::Close) => {
-            //                 let mut closed_guard = stream_cloned.closed.lock().await;
-
-            //                 *closed_guard = true;
-
-            //                 break;
-            //             }
-            //             None => {
-            //                 break;
-            //             }
-            //         }
-            //     }
-            // });
-
-            let stream_cloned = stream.clone();
-
-            tokio::spawn(async move {
-                loop {
-                    if stream_cloned.is_closed().await {
-                        break;
-                    }
-
-                    let mut wb = stream_cloned.write_buffer.lock().await;
-
-                    if !wb.is_empty() {
-                        let write_len = wb.len();
-                        let data: Vec<u8> = wb.drain(..write_len).collect();
-                        drop(wb);
-
-                        let mut state = state_cloned.lock().await;
-                        state.try_send_data(data).await;
-                    } else {
-                        drop(wb);
-                    }
-
-                    sleep(Duration::from_millis(10)).await;
-                }
-            });
-
-            let key = (
-                packet.source_socket().to_string(),
-                packet.destination_socket().to_string(),
-            );
-
-            self.conections.insert(key, stream.clone());
-
-            let mut state_guard = state.lock().await;
-            state_guard.process_event(packet).await?;
-
-            // stream.handle.send_packet(packet.clone())?;
+            // SYN обрабатывается задачей соединения (SYN-ACK уйдёт из PacketHandler)
+            let _ = event_tx.send(ConnEvent::Packet(packet));
 
             return Ok(Some(stream));
         }
 
-        let key = (
-            packet.source_socket().to_string(),
-            packet.destination_socket().to_string(),
-        );
-
-        let stream = match self.conections.get(&key) {
-            Some(val) => val.clone(),
+        match self.connections.get(&key) {
+            Some(event_tx) => {
+                let _ = event_tx.send(ConnEvent::Packet(packet));
+            }
             None => {
                 let mut rng = rand::rng();
                 let socket = Arc::clone(&self.socket);
@@ -477,33 +252,55 @@ impl IpOverUdpServer {
                     packet.options().timestamp.0,
                     65535,
                 )?;
-                send_response(&response_raw, &socket, socket_addr).await?;
-                return Ok(None);
+                utils::send_response(response_raw, socket, socket_addr).await?;
             }
-        };
-
-        let mut state_guard = stream.state.lock().await;
-
-        state_guard.process_event(packet.clone()).await?;
+        }
 
         Ok(None)
     }
 }
 
-async fn send_response(
-    response_raw: &Vec<u8>,
-    socket: &UdpSocket,
-    addr: SocketAddr,
-) -> Result<(), std::io::Error> {
-    if let Err(e) = socket.send_to(response_raw.as_slice(), addr).await {
-        error!("Failed to send answer to udp socket: {}", e);
+/// Задача соединения: единственный владелец FSM данного потока.
+/// Обрабатывает пакеты от пира и пробуждения драйвера отправки;
+/// медленная обработка одного соединения не задерживает остальные.
+async fn conn_task(
+    mut fsm: TcpStateMachine,
+    mut rx: UnboundedReceiver<ConnEvent>,
+    flow_control_tx: UnboundedSender<FlowControl>,
+    key: FlowKey,
+) {
+    let notify = fsm.notify();
 
-        return Err(std::io::Error::other(e.to_string()));
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(ConnEvent::Packet(packet)) => {
+                        if let Err(e) = fsm.process_event(packet).await {
+                            error!("process_event failed for {}: {}", key.source, e);
+                        }
+                    }
+                    Some(ConnEvent::Close) => {
+                        fsm.close().await;
+                    }
+                    None => break,
+                }
+            }
+            // Пробуждение драйвера отправки: write-половинка / poll_read
+            _ = notify.notified() => {
+                fsm.pump_send().await;
+            }
+        }
+
+        // RST/аборт или завершение закрытия: соединение закончено
+        let state = fsm.state();
+        if state == TcpState::Closed || state == TcpState::FinWait2 {
+            break;
+        }
     }
 
-    dump_raw_packet(response_raw, "Sent");
-
-    Ok(())
+    // Чистим таблицу потоков
+    let _ = flow_control_tx.send(FlowControl::Remove(key));
 }
 
 pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
@@ -545,7 +342,13 @@ pub async fn handle_upd() -> Result<(), Box<dyn Error>> {
                         }
                     }
 
-                    client_stream.close();
+                    // Одна из ног закончилась: закрываем обе исходящие стороны
+                    // (EOF таргету; FIN клиенту — poll_shutdown ждёт фактической
+                    // отправки FIN, см. tcp_stream.rs)
+                    let _ = write_destination.shutdown().await;
+                    let _ = write_client.shutdown().await;
+
+                    client_stream.close().await;
 
                     debug!("Stream/client pipe was closed ({})", addr);
                 }
@@ -570,6 +373,7 @@ mod tests {
     use etherparse::{PacketBuilder, TcpOptionElement};
     use rand::Rng;
     use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, UdpSocket},
         time::timeout,
     };
@@ -578,7 +382,7 @@ mod tests {
         handle_udp::{IpOverUdpServer, IpUdpStream},
         net_packet_parser::{
             IpTcpPacket, Packet, RawIpPacket, get_ack_data_response, get_ack_response,
-            net_packet_parser,
+            get_fin_response, net_packet_parser,
         },
     };
 
@@ -773,21 +577,24 @@ mod tests {
             _ => panic!("No client response received"),
         };
 
-        let buffer = stream.read_buffer.lock().await;
+        // Данные, отправленные с PSH, FSM флашит в recv-половинку потока
+        let mut recv = stream.recv.clone();
+        let mut read_buffer = vec![0u8; payload.len()];
+        timeout(Duration::from_millis(1000), recv.read_exact(&mut read_buffer))
+            .await
+            .expect("Данные не дошли до recv-половинки")
+            .unwrap();
 
-        let read_buffer = String::from_utf8_lossy(&buffer);
-
-        assert_eq!(read_buffer, "Hello world".to_string());
+        assert_eq!(String::from_utf8_lossy(&read_buffer), "Hello world".to_string());
 
         nex_seq_num
     }
 
     async fn assert_data_response(client: &UdpSocket, stream: Arc<IpUdpStream>) {
-        let mut write_buffer = stream.write_buffer.lock().await;
+        // Пишем через write-половинку: драйвер перекачает данные в FSM и отправит
+        let mut send = stream.send.clone();
 
-        *write_buffer = "The world is here".as_bytes().to_vec();
-
-        drop(write_buffer);
+        send.write_all("The world is here".as_bytes()).await.unwrap();
 
         let mut buffer = [0u8; 1024];
 
@@ -898,19 +705,173 @@ mod tests {
 
         server.recv().await.unwrap();
 
-        let mut write_buffer = stream.write_buffer.lock().await;
+        // Детерминированный синк: RST обрабатывается задачей соединения
+        // асинхронно; EOF на read-половинке означает, что RST обработан
+        let mut recv = stream.recv.clone();
+        let mut eof_buf = [0u8; 1];
+        let eof_n = timeout(Duration::from_millis(1000), recv.read(&mut eof_buf))
+            .await
+            .expect("RST не обработан: EOF не получен")
+            .unwrap();
+        assert_eq!(eof_n, 0, "Ожидался EOF после RST");
 
-        *write_buffer = "The world is here".as_bytes().to_vec();
-
-        drop(write_buffer);
+        // После RST write-половинка может принять данные, но драйвер не должен
+        // отправить ни одного пакета (guard send_pending_data при Closed)
+        let mut send = stream.send.clone();
+        send.write_all("The world is here".as_bytes()).await.unwrap();
 
         let mut buffer = [0u8; 1024];
 
         match timeout(Duration::from_millis(1000), client.recv_from(&mut buffer)).await {
-            Ok(Ok((_, _))) => {
-                panic!("Client shouldn't receive any data.");
+            Ok(Ok((n, _))) => {
+                if let Some(Packet::Ipv4Tcp(packet)) = net_packet_parser(&buffer[..n]) {
+                    let tcp = packet.tcp();
+                    panic!(
+                        "Client shouldn't receive any data. packet: seq={} ack={} syn={} fin={} rst={} psh={} payload={:?}",
+                        packet.sequence_number(),
+                        packet.acknowledgment_number(),
+                        tcp.flags.syn,
+                        tcp.flags.fin,
+                        tcp.flags.rst,
+                        tcp.flags.psh,
+                        String::from_utf8_lossy(&tcp.payload)
+                    );
+                }
+                panic!("Client shouldn't receive any data (unparsed).");
             }
             _ => {}
         };
+    }
+
+    #[tokio::test]
+    async fn test_two_flows() {
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let mut server = IpOverUdpServer::new("127.0.0.1:0").await.unwrap();
+
+        let SocketAddr::V4(destination_addr) = destination.local_addr().unwrap() else {
+            panic!("Expected IPv4 address");
+        };
+
+        // Два независимых клиента: полный обмен данными в каждом потоке.
+        // Проверяет, что обработка одного потока не блокирует другой.
+        let client1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let SocketAddr::V4(source_addr1) = client1.local_addr().unwrap() else {
+            panic!("Expected IPv4 address");
+        };
+        let SocketAddr::V4(source_addr2) = client2.local_addr().unwrap() else {
+            panic!("Expected IPv4 address");
+        };
+
+        assert_initial_data_exchange(&client1, destination_addr, &mut server, source_addr1).await;
+        assert_initial_data_exchange(&client2, destination_addr, &mut server, source_addr2).await;
+    }
+
+    #[tokio::test]
+    async fn test_fin() {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let mut server = IpOverUdpServer::new("127.0.0.1:0").await.unwrap();
+
+        let SocketAddr::V4(destination_addr) = destination.local_addr().unwrap() else {
+            panic!("Expected IPv4 address");
+        };
+
+        let SocketAddr::V4(source_addr) = client.local_addr().unwrap() else {
+            panic!("Expected IPv4 address");
+        };
+
+        let (stream, seq_num, server_seq_num, server_timestamp) =
+            assert_syn(&client, destination_addr, &mut server, source_addr).await;
+
+        // Завершаем установление соединения и обмен данными
+        assert_ack(
+            server_seq_num + 1,
+            &client,
+            destination_addr,
+            seq_num,
+            &mut server,
+            source_addr,
+            server_timestamp,
+        )
+        .await;
+
+        assert_ack(
+            server_seq_num + 18, // SYN + 17 байт данных "The world is here"
+            &client,
+            destination_addr,
+            seq_num,
+            &mut server,
+            source_addr,
+            server_timestamp,
+        )
+        .await;
+
+        // --- Часть 1: пир закрывает свою сторону (FIN) → EOF на read ---
+        let curr_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32;
+
+        let fin_packet = get_fin_response(
+            server_seq_num + 18,
+            *destination_addr.ip(),
+            destination_addr.port(),
+            seq_num,
+            *source_addr.ip(),
+            source_addr.port(),
+            curr_timestamp,
+            65535,
+        )
+        .unwrap();
+
+        client
+            .send_to(fin_packet.as_slice(), server.socket.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        server.recv().await.unwrap();
+
+        // Сервер отвечает ACK на FIN
+        let mut buffer = [0u8; 1024];
+
+        match timeout(Duration::from_millis(1000), client.recv_from(&mut buffer)).await {
+            Ok(Ok((n, _))) => {
+                let Some(Packet::Ipv4Tcp(packet)) = net_packet_parser(&buffer[..n]) else {
+                    panic!("Expected ipv4/tcp packet");
+                };
+
+                assert!(packet.tcp.flags.ack);
+                assert_eq!(packet.tcp.acknowledgment_number, seq_num + 1);
+            }
+            _ => panic!("No FIN-ACK received"),
+        }
+
+        // Read-половинка сигналит EOF после опустошения буфера
+        let mut recv = stream.recv.clone();
+        let mut eof_buf = [0u8; 1];
+        let n = timeout(Duration::from_millis(1000), recv.read(&mut eof_buf))
+            .await
+            .expect("EOF после FIN не получен")
+            .unwrap();
+        assert_eq!(n, 0, "Ожидался EOF (Ok(0)) после FIN");
+
+        // --- Часть 2: прокси закрывает свою сторону (shutdown → FIN) ---
+        let mut send = stream.send.clone();
+        send.shutdown().await.unwrap();
+
+        match timeout(Duration::from_millis(1000), client.recv_from(&mut buffer)).await {
+            Ok(Ok((n, _))) => {
+                let Some(Packet::Ipv4Tcp(packet)) = net_packet_parser(&buffer[..n]) else {
+                    panic!("Expected ipv4/tcp packet");
+                };
+
+                assert!(packet.tcp.flags.fin, "Ожидался FIN после shutdown");
+            }
+            _ => panic!("No FIN received after shutdown"),
+        }
     }
 }
