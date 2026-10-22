@@ -5,6 +5,9 @@ mod tcp_state_machine;
 mod tcp_stream;
 mod utils;
 
+#[cfg(test)]
+mod net_env;
+
 use handle_udp::handle_upd;
 use std::error::Error;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
